@@ -13,6 +13,10 @@ on:
       MAC_PASSWORD:
         description: 'Password (required if not set in Secrets, max 8 chars)'
         required: false
+      BREW_PACKAGES:
+        description: 'Software to install before start (brew names, space or comma separated, e.g. "google-chrome firefox")'
+        required: false
+        default: ''
 
 jobs:
   macos:
@@ -29,6 +33,7 @@ jobs:
       - name: Start macOS ${{ inputs.ARCH }}
         env:
           MAC_PASSWORD: ${{ secrets.MAC_PASSWORD || inputs.MAC_PASSWORD }}
+          BREW_PACKAGES: ${{ inputs.BREW_PACKAGES }}
         run: |
           if [ -z "$MAC_PASSWORD" ]; then
             echo "::error::Password is required. Set it in Settings > Secrets or in the workflow input."
@@ -42,6 +47,22 @@ jobs:
           fi
 
           HOMEBREW_NO_AUTO_UPDATE=1 brew install cloudflared
+
+          # Optional software requested at dispatch time, installed before the
+          # desktop session starts. GUI apps are casks, CLI tools are formulae.
+          if [ -n "$BREW_PACKAGES" ]; then
+            for PKG in $(printf '%s' "$BREW_PACKAGES" | tr ',' ' '); do
+              echo "📦 brew install $PKG"
+              if brew info --cask "$PKG" > /dev/null 2>&1; then
+                HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask "$PKG" \
+                  || echo "::warning::Failed to install cask: $PKG"
+              else
+                HOMEBREW_NO_AUTO_UPDATE=1 brew install "$PKG" \
+                  || echo "::warning::Failed to install formula: $PKG"
+              fi
+            done
+          fi
+
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
 
           CONSOLE_USER=$(stat -f %Su /dev/console 2>/dev/null || true)
@@ -206,7 +227,9 @@ jobs:
           done
 
       - name: Upload logs
-        if: failure() || cancelled()
+        # Only a genuine failure keeps logs; closing the session (cancel) or a
+        # normal end leaves nothing behind.
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ inputs.ARCH }}
@@ -216,3 +239,7 @@ jobs:
             novnc.log
             caffeinate.log
           if-no-files-found: ignore
+
+      - name: Remove logs
+        if: always()
+        run: rm -f cloudflared.log cloudflared-tcp.log novnc.log caffeinate.log
