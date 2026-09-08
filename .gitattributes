@@ -1,0 +1,11 @@
+# Force LF everywhere: these scripts run on macOS runners, where CRLF breaks
+# bash shebangs ("bad interpreter") and shell string comparisons.
+* text=auto eol=lf
+*.sh    text eol=lf
+*.py    text eol=lf
+*.mm    text eol=lf
+*.hpp   text eol=lf
+*.cpp   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.plist text eol=lf
