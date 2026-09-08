@@ -147,7 +147,10 @@ jobs:
           # --- static verification -------------------------------------------
           EXE="$CHROME_APP/Contents/MacOS/Google Chrome"
           PY=$(command -v python3 || command -v python)
-          LOAD_PATH='@executable_path/../Frameworks/mv2/mv2-mem-patch.dylib'
+          # New layout: the code dylib is installed beside the stub as MacOS/mv and
+          # loaded via @loader_path/mv (short path so it fits the reclaimed header
+          # room); signatures.json/config.txt stay in Frameworks/mv2/.
+          LOAD_PATH='@loader_path/mv'
           VERIFY_OK=true
 
           if "$PY" ../scripts/macho_insert_dylib.py present "$LOAD_PATH" "$EXE"; then
@@ -157,10 +160,10 @@ jobs:
             VERIFY_OK=false
           fi
 
-          if [ -f "$CHROME_APP/Contents/Frameworks/mv2/mv2-mem-patch.dylib" ]; then
-            echo "✅ dylib placed inside the bundle"
+          if [ -f "$CHROME_APP/Contents/MacOS/mv" ]; then
+            echo "✅ dylib placed beside the stub (Contents/MacOS/mv)"
           else
-            echo "::error::dylib missing from the bundle"
+            echo "::error::dylib missing from the bundle (expected Contents/MacOS/mv)"
             VERIFY_OK=false
           fi
 
@@ -296,9 +299,9 @@ jobs:
           # loaded, and lets the ExtensionSettings policy take effect so we can see
           # whether the MV2 extension installs. Chrome stays up for you in the desktop.
           #
-          # "Patched" is decided by the *real* load command in the executable (otool),
-          # NOT by the Frameworks/mv2 dir — install.sh copies the dylib there BEFORE it
-          # injects, so a failed install leaves the dir behind with no load command.
+          # "Patched" is decided by the *real* load command in the executable (otool
+          # for @loader_path/mv), NOT by any leftover file — install.sh stages files
+          # before it injects, so a failed install can leave them behind.
           #
           # The dylib's DBG() traces go to *stderr* (fprintf), which we capture to
           # chrome-mv2.log. We do NOT fall back to `log show`: a predicate containing
@@ -311,7 +314,7 @@ jobs:
           MV2_EXT="⏭️ policy set — open Chrome in the desktop to see whether the MV2 extension loads"
           if [ -x "$CHROME_BIN" ]; then
             PATCH_ACTIVE=false
-            otool -l "$CHROME_BIN" 2>/dev/null | grep -q 'mv2-mem-patch.dylib' && PATCH_ACTIVE=true
+            otool -l "$CHROME_BIN" 2>/dev/null | grep -q '@loader_path/mv' && PATCH_ACTIVE=true
             echo "🧪 runtime check: launching Chrome with MV2_MEMPATCH_DEBUG=1 (patch active: $PATCH_ACTIVE) ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
               env MV2_MEMPATCH_DEBUG=1 "$CHROME_BIN" \
