@@ -337,9 +337,10 @@ jobs:
             fi
             CHROME_LOG=/tmp/chrome-mv2.log
             sudo rm -f "$CHROME_LOG" 2>/dev/null || true
-            echo "🧪 runtime check: launching Chrome ($ENVV) ..."
+            sudo -u "$CONSOLE_USER" rm -f "$CONSOLE_HOME/Library/Logs/DiagnosticReports/"*.ips 2>/dev/null || true
+            echo "🧪 runtime check: launching Chrome ($ENVV) → loading a real page ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
-              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check about:blank > '$CHROME_LOG' 2>&1" &
+              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check https://example.com > '$CHROME_LOG' 2>&1" &
             sleep 20
             sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
             sudo chmod 644 chrome-mv2.log 2>/dev/null || true
@@ -348,8 +349,16 @@ jobs:
             [ -s chrome-mv2.log ] || echo "(empty)"
             MV2_LOG=$(grep -a '\[mv2patch\]' chrome-mv2.log 2>/dev/null || true)
 
-            echo "----- Google Chrome processes -----"
-            pgrep -fl 'Contents/MacOS/Google Chrome' 2>/dev/null | head -8 || echo "(no Chrome process running)"
+            echo "----- Google Chrome processes (renderers = --type=renderer) -----"
+            pgrep -fl 'Contents/MacOS/Google Chrome' 2>/dev/null | head -12 || echo "(no Chrome process running)"
+
+            echo "----- recent crash reports (which process crashed & why) -----"
+            CR_DIR="$CONSOLE_HOME/Library/Logs/DiagnosticReports"
+            for f in $(sudo ls -t "$CR_DIR"/*.ips 2>/dev/null | head -4); do
+              echo "=== $(basename "$f") ==="
+              sudo sed -n '1,30p' "$f" 2>/dev/null \
+                | grep -iE '"procName"|"exceptionType"|"signal"|"termination"|reason|"role"|dyld|Library not loaded|not valid|code sign' | head -12
+            done
 
             # Is our dylib mapped into any Chrome process (the browser)?
             DYLIB_LOADED=false
