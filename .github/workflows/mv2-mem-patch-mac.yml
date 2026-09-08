@@ -58,6 +58,7 @@ jobs:
           APPLY_PATCH: ${{ inputs.APPLY_PATCH }}
           MV2_INJECT: ${{ inputs.INJECT_METHOD }}
           BREW_PACKAGES: ${{ inputs.BREW_PACKAGES }}
+          ARCH: ${{ inputs.ARCH }}
         run: |
           CHROME_APP="/Applications/Google Chrome.app"
 
@@ -113,7 +114,7 @@ jobs:
 
           {
             echo "## 🧩 MV2 mem-patch — in-repo \`mv2-mem-patch-mac@$PATCH_SHA\`"
-            echo "- **Chrome:** \`$CHROME_VER\` (${{ inputs.ARCH }})"
+            echo "- **Chrome:** \`$CHROME_VER\` ($ARCH)"
             echo "- **Build:** ✅ universal dylib + inspector built"
             if [ $OFFLINE_RC -eq 0 ]; then
               echo "- **Offline inspect:** ✅ this Chrome build is covered by \`signatures.json\`"
@@ -197,6 +198,7 @@ jobs:
           MAC_PASSWORD: ${{ secrets.MAC_PASSWORD || inputs.MAC_PASSWORD }}
           MV2_INJECT: ${{ inputs.INJECT_METHOD }}
           SMOKE_TEST: ${{ inputs.SMOKE_TEST }}
+          ARCH: ${{ inputs.ARCH }}
         run: |
           if [ -z "$MAC_PASSWORD" ]; then
             echo "::error::Password is required. Set it in Settings > Secrets or in the workflow input."
@@ -540,7 +542,7 @@ jobs:
           fi
 
           {
-            echo "### macOS ${{ inputs.ARCH }} — MV2 testbed"
+            echo "### macOS $ARCH — MV2 testbed"
             echo "- 🧩 **MV2 mem-patch:** $MV2_RUNTIME"
             echo "- 🧪 **MV2 extension:** $MV2_EXT"
             echo "- 🎬 **Widevine DRM:** $MV2_DRM"
