@@ -305,11 +305,23 @@ jobs:
             PATCH_ACTIVE=false
             otool -l "$CHROME_BIN" 2>/dev/null | grep -q '@loader_path/mv' && PATCH_ACTIVE=true
             echo "🧪 runtime check: launching Chrome with MV2_MEMPATCH_DEBUG=1 (patch active: $PATCH_ACTIVE) ..."
+            # Redirect Chrome's stderr INSIDE the user context to a shared file —
+            # `launchctl asuser` does not reliably inherit our stdio, so a plain
+            # `> chrome-mv2.log` on our side can come back empty. Then copy it out.
+            CHROME_LOG=/tmp/chrome-mv2.log
+            sudo rm -f "$CHROME_LOG" 2>/dev/null || true
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
-              env MV2_MEMPATCH_DEBUG=1 "$CHROME_BIN" \
-              --no-first-run --no-default-browser-check about:blank \
-              > chrome-mv2.log 2>&1 &
+              bash -c "MV2_MEMPATCH_DEBUG=1 '$CHROME_BIN' --no-first-run --no-default-browser-check about:blank > '$CHROME_LOG' 2>&1" &
             sleep 15
+            sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
+            sudo chmod 644 chrome-mv2.log 2>/dev/null || true
+
+            echo "----- chrome-mv2.log (Chrome stderr, first 60 lines) -----"
+            sed -n '1,60p' chrome-mv2.log 2>/dev/null || true
+            [ -s chrome-mv2.log ] || echo "(chrome-mv2.log is EMPTY)"
+            echo "----- Google Chrome processes -----"
+            pgrep -fl 'Google Chrome' 2>/dev/null | head -8 || echo "(no Chrome process running)"
+            echo "---------------------------------------------------------"
 
             if [ "$PATCH_ACTIVE" = true ]; then
               MV2_LOG=$(grep -a '\[mv2patch\]' chrome-mv2.log 2>/dev/null || true)
