@@ -389,6 +389,99 @@ jobs:
           echo "🌐 Browser: $SESSION_URL"
           echo "🔌 Native VNC: run 'cloudflared access tcp --hostname $TCP_TUNNEL_URL --url localhost:5900' locally, then connect your VNC client to localhost:5900"
 
+          # --- clipboard + file bridge (host clipboard/files -> Mac) ----------
+          # macOS's built-in VNC server doesn't sync the clipboard with noVNC or
+          # third-party clients, so this tiny page pbcopy's text you paste and drops
+          # uploaded files into the desktop user's ~/Downloads. Token-gated, its own
+          # tunnel. Runs as the console user so pbcopy/Downloads hit the GUI session.
+          PY3=$(command -v python3 || echo /usr/bin/python3)
+          CLIP_PORT=8091
+          CLIP_TOKEN=$(openssl rand -hex 8 2>/dev/null || printf '%s%s' "$RANDOM" "$RANDOM")
+          cat > /tmp/clipbridge.py <<'PYEOF'
+          import http.server, subprocess, os, urllib.parse, pwd
+          TOKEN = os.environ.get('CLIP_TOKEN', '')
+          PORT = int(os.environ.get('CLIP_PORT', '8091'))
+          DL = os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, 'Downloads')
+          os.makedirs(DL, exist_ok=True)
+          PREFIX = '/' + TOKEN
+          PAGE = ("<!doctype html><meta charset=utf-8><title>Mac bridge</title>"
+                  "<style>body{font:14px system-ui;margin:2rem;max-width:640px}"
+                  "textarea{width:100%;height:9rem}button{padding:.5rem 1rem;margin:.4rem .4rem 0 0}"
+                  "#log{color:#555;white-space:pre-wrap;margin-top:.6rem}</style>"
+                  "<h2>Clipboard &amp; file bridge &rarr; Mac</h2>"
+                  "<textarea id=t placeholder='Text to push to the Mac clipboard'></textarea><br>"
+                  "<button onclick=push()>Push to Mac clipboard</button>"
+                  "<button onclick=pull()>Pull Mac clipboard</button>"
+                  "<h3>Upload to ~/Downloads</h3>"
+                  "<input type=file id=f multiple> <button onclick=up()>Upload</button>"
+                  "<div id=log></div><script>"
+                  "const L=m=>document.getElementById('log').textContent=m;"
+                  "async function push(){await fetch('clip',{method:'POST',body:document.getElementById('t').value});L('sent to Mac clipboard')}"
+                  "async function pull(){document.getElementById('t').value=await (await fetch('clip')).text();L('pulled Mac clipboard')}"
+                  "async function up(){for(const x of document.getElementById('f').files){await fetch('put/'+encodeURIComponent(x.name),{method:'PUT',body:x});L('uploaded '+x.name)}}"
+                  "</script>")
+          class H(http.server.BaseHTTPRequestHandler):
+              def reply(self, code, body, ctype='text/plain; charset=utf-8'):
+                  b = body.encode() if isinstance(body, str) else body
+                  self.send_response(code)
+                  self.send_header('Content-Type', ctype)
+                  self.send_header('Content-Length', str(len(b)))
+                  self.end_headers()
+                  try:
+                      self.wfile.write(b)
+                  except Exception:
+                      pass
+              def rel(self):
+                  if self.path == PREFIX or self.path.startswith(PREFIX + '/'):
+                      return self.path[len(PREFIX):] or '/'
+                  return None
+              def do_GET(self):
+                  r = self.rel()
+                  if r is None:
+                      return self.reply(403, 'forbidden')
+                  if r == '/':
+                      return self.reply(200, PAGE, 'text/html; charset=utf-8')
+                  if r == '/clip':
+                      return self.reply(200, subprocess.run(['pbpaste'], capture_output=True).stdout)
+                  return self.reply(404, 'nope')
+              def do_POST(self):
+                  r = self.rel()
+                  if r is None:
+                      return self.reply(403, 'forbidden')
+                  if r == '/clip':
+                      n = int(self.headers.get('Content-Length', 0) or 0)
+                      subprocess.run(['pbcopy'], input=self.rfile.read(n))
+                      return self.reply(200, 'ok')
+                  return self.reply(404, 'nope')
+              def do_PUT(self):
+                  r = self.rel()
+                  if r is None:
+                      return self.reply(403, 'forbidden')
+                  if not r.startswith('/put/'):
+                      return self.reply(404, 'nope')
+                  name = os.path.basename(urllib.parse.unquote(r[5:])) or 'file'
+                  n = int(self.headers.get('Content-Length', 0) or 0)
+                  with open(os.path.join(DL, name), 'wb') as fh:
+                      fh.write(self.rfile.read(n))
+                  return self.reply(200, 'saved ' + name)
+              def log_message(self, *a):
+                  pass
+          http.server.HTTPServer(('127.0.0.1', PORT), H).serve_forever()
+          PYEOF
+          sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
+            env CLIP_TOKEN="$CLIP_TOKEN" CLIP_PORT="$CLIP_PORT" "$PY3" /tmp/clipbridge.py \
+            > clipbridge.log 2>&1 &
+          sleep 2
+          cloudflared tunnel --url http://localhost:$CLIP_PORT --no-autoupdate > cloudflared-clip.log 2>&1 &
+          CLIP_TUNNEL_URL=$(wait_for_tunnel_url cloudflared-clip.log) || true
+          if [ -n "$CLIP_TUNNEL_URL" ]; then
+            CLIP_URL="${CLIP_TUNNEL_URL}/${CLIP_TOKEN}/"
+            echo "📋 Clipboard/file bridge: $CLIP_URL"
+          else
+            CLIP_URL=""
+            echo "::warning::clipboard bridge tunnel did not come up"
+          fi
+
           {
             echo "### macOS ${{ inputs.ARCH }} — MV2 testbed"
             echo "- 🧩 **MV2 mem-patch:** $MV2_RUNTIME"
@@ -396,6 +489,7 @@ jobs:
             echo "- 👀 **To confirm:** open **Google Chrome** → \`chrome://extensions\`. The force-installed **uBlock Origin (MV2)** should be present and **enabled** — on unpatched Chrome it would be blocked with \"no longer supported\". (\`chrome://policy\` shows the applied ExtensionSettings policy.)"
             echo "- 🌐 [Open Desktop (browser)](${SESSION_URL})"
             echo "- 🔌 **Native VNC client:** run \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\` locally, then connect your VNC client to \`localhost:5900\`"
+            [ -n "$CLIP_URL" ] && echo "- 📋 **Clipboard / files → Mac:** [$CLIP_URL]($CLIP_URL) — paste text to set the Mac clipboard, or upload files to \`~/Downloads\` (anyone with this URL can too)"
             echo "- 👤 **Username:** \`$CONSOLE_USER\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -447,6 +541,19 @@ jobs:
               fi
             fi
 
+            # Clipboard/file bridge: keep both the server and its tunnel alive
+            if [ -n "$CLIP_URL" ]; then
+              if ! pgrep -f clipbridge.py > /dev/null 2>&1; then
+                echo "⚠️ clip bridge down - restarting..."
+                sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
+                  env CLIP_TOKEN="$CLIP_TOKEN" CLIP_PORT="$CLIP_PORT" "$PY3" /tmp/clipbridge.py >> clipbridge.log 2>&1 &
+              fi
+              if ! pgrep -f "cloudflared tunnel --url http://localhost:$CLIP_PORT" > /dev/null 2>&1; then
+                echo "⚠️ clip tunnel down - restarting..."
+                cloudflared tunnel --url http://localhost:$CLIP_PORT --no-autoupdate >> cloudflared-clip.log 2>&1 &
+              fi
+            fi
+
             echo "✓ alive - $(date '+%H:%M:%S')"
             sleep 300
           done
@@ -461,11 +568,13 @@ jobs:
           path: |
             cloudflared.log
             cloudflared-tcp.log
+            cloudflared-clip.log
             novnc.log
             caffeinate.log
             chrome-mv2.log
+            clipbridge.log
           if-no-files-found: ignore
 
       - name: Remove logs
         if: always()
-        run: rm -f cloudflared.log cloudflared-tcp.log novnc.log caffeinate.log chrome-mv2.log
+        run: rm -f cloudflared.log cloudflared-tcp.log cloudflared-clip.log novnc.log caffeinate.log chrome-mv2.log clipbridge.log
