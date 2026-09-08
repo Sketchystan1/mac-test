@@ -304,13 +304,54 @@ jobs:
           fi
           [ -z "$UBO_SRC" ] && echo "::warning::could not fetch the uBlock MV2 build"
 
+          # macOS equivalent of Windows' HKLM\Software\Policies\Google\Chrome + ExtensionSettings:
+          # a CONFIGURATION PROFILE with a com.google.Chrome payload. It's the mandatory,
+          # persistent, machine-wide policy channel (no registry on macOS; user-domain
+          # `defaults` is "recommended" only = no force-install). force_installed is the
+          # one extension-install path branded Chrome still honors, so uBlock reinstalls
+          # and persists. macOS 13+ may require a one-time approval in
+          # System Settings > Privacy & Security > Profiles.
+          POLICY_MC=/tmp/chrome-mv2.mobileconfig
+          cat > "$POLICY_MC" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>PayloadContent</key><array><dict>
+              <key>PayloadType</key><string>com.google.Chrome</string>
+              <key>PayloadIdentifier</key><string>com.google.Chrome.mv2</string>
+              <key>PayloadUUID</key><string>1D9E2F70-0000-4000-8000-000000000001</string>
+              <key>PayloadVersion</key><integer>1</integer>
+              <key>PayloadEnabled</key><true/>
+              <key>PayloadDisplayName</key><string>Chrome MV2 ExtensionSettings</string>
+              <key>ExtensionSettings</key><dict>
+                <key>fkgkibajhfbepljeaefdnfnegdcjomkh</key><dict>
+                  <key>installation_mode</key><string>force_installed</string>
+                  <key>update_url</key><string>https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml</string>
+                </dict>
+              </dict>
+            </dict></array>
+            <key>PayloadType</key><string>Configuration</string>
+            <key>PayloadIdentifier</key><string>mv2.testbed.chrome.policy</string>
+            <key>PayloadUUID</key><string>1D9E2F70-0000-4000-8000-000000000002</string>
+            <key>PayloadVersion</key><integer>1</integer>
+            <key>PayloadScope</key><string>System</string>
+            <key>PayloadDisplayName</key><string>MV2 uBlock Policy (Chrome)</string>
+          </dict></plist>
+          PLIST
+          if sudo profiles install -type=configuration -path="$POLICY_MC" 2>/tmp/prof.err; then
+            echo "🧩 installed Chrome ExtensionSettings via configuration profile (force_installed)"
+          else
+            echo "::warning::profiles install did not auto-apply (needs approval in System Settings > Profiles): $(head -1 /tmp/prof.err 2>/dev/null)"
+          fi
+
           # Resolve the console user's real home (RecordName may be aliased to admin
           # while the home dir stays /Users/<runner>), for the on-disk extension check.
           CONSOLE_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
           [ -n "$CONSOLE_HOME" ] || CONSOLE_HOME="/Users/$CONSOLE_USER"
 
-          # Stage the unpacked uBlock MV2 on the desktop user's Desktop for a one-click
-          # "Load unpacked" (chrome://extensions → Developer mode → Load unpacked).
+          # Stage the unpacked uBlock MV2 + the policy profile on the Desktop, so in the
+          # desktop you can either double-click chrome-mv2.mobileconfig to install/approve
+          # the policy (persistent force-install), or Load unpacked uBlock0-MV2 (one-off).
           UBO_DESKTOP=""
           if [ -n "$UBO_SRC" ]; then
             UBO_DESKTOP="$CONSOLE_HOME/Desktop/uBlock0-MV2"
@@ -319,6 +360,15 @@ jobs:
               sudo cp -R "$UBO_SRC" "$UBO_DESKTOP" 2>/dev/null || true
             echo "🧩 staged uBlock MV2 → $UBO_DESKTOP"
           fi
+          cp "$POLICY_MC" "$CONSOLE_HOME/Desktop/chrome-mv2.mobileconfig" 2>/dev/null \
+            && chown "$CONSOLE_USER" "$CONSOLE_HOME/Desktop/chrome-mv2.mobileconfig" 2>/dev/null || true
+
+          # Stop Google Keystone auto-update this session: an auto-update drops a fresh
+          # STOCK main executable (no LSEnvironment/re-sign), so the dylib stops loading
+          # and MV2 turns off again. Disabling the update check keeps the patch alive.
+          sudo -u "$CONSOLE_USER" defaults write com.google.Keystone.Agent checkInterval 0 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.google.Keystone.Agent checkInterval 0 2>/dev/null || true
+          sudo -u "$CONSOLE_USER" launchctl remove com.google.keystone.agent 2>/dev/null || true
 
           # Runtime check. Launch Chrome the NORMAL way (LaunchServices/`open`, in the
           # GUI session) so the dyld method's Info.plist LSEnvironment takes effect. We
@@ -400,13 +450,19 @@ jobs:
                 | grep -viE "screensharing|cloudflared|novnc" | tail -25
             fi
 
-            # uBlock is staged for a manual dev-mode "Load unpacked" (branded Chrome
-            # blocks every automated MV2 install path). Report where it is.
-            if [ -n "$UBO_DESKTOP" ]; then
-              echo "🧩 uBlock MV2 staged at $UBO_DESKTOP — load it in chrome://extensions (Developer mode → Load unpacked)"
-              MV2_EXT="🧩 uBlock (MV2) staged on the **Desktop** as \`uBlock0-MV2\`. In \`chrome://extensions\` turn on **Developer mode** → **Load unpacked** → pick that folder. With the patch it loads; on stock Chrome it's refused (\"Manifest version 2 is no longer supported\")."
+            # Did the policy profile auto-apply? A force_installed extension lands in
+            # Default/Extensions/<id>. If the profile needed approval it won't yet, and
+            # the staged Desktop copies (profile + unpacked uBlock) are the fallback.
+            EXT_DIR="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Extensions/$UBO_ID"
+            for i in {1..20}; do sudo test -d "$EXT_DIR" && break; sleep 3; done
+            if sudo test -d "$EXT_DIR"; then
+              echo "✅ uBlock force-installed by the profile policy ($EXT_DIR)"
+              MV2_EXT="✅ uBlock (MV2) **force-installed by the configuration-profile policy** — persistent. Confirm at \`chrome://extensions\` / \`chrome://policy\`."
+            elif [ -n "$UBO_DESKTOP" ]; then
+              echo "policy not auto-applied yet (likely awaiting profile approval)"
+              MV2_EXT="🧩 Policy profile staged (force_installed uBlock). If \`chrome://policy\` is empty, double-click **\`chrome-mv2.mobileconfig\`** on the Desktop → approve in **System Settings > Profiles**, relaunch Chrome. One-off: Load unpacked **\`uBlock0-MV2\`** from the Desktop."
             else
-              MV2_EXT="⚠️ couldn't stage uBlock automatically — download uBlock Origin's chromium build and Load unpacked it in the desktop"
+              MV2_EXT="⚠️ couldn't stage uBlock — download uBlock Origin's chromium build and Load unpacked it in the desktop"
             fi
 
             # DRM gate: open the castLabs Widevine VMP lab so it's ready to inspect.
@@ -562,7 +618,7 @@ jobs:
             echo "- 🧩 **MV2 mem-patch:** $MV2_RUNTIME"
             echo "- 🧪 **MV2 extension:** $MV2_EXT"
             echo "- 🎬 **Widevine DRM:** $MV2_DRM"
-            echo "- 👀 **To confirm MV2:** open \`chrome://extensions\` → turn on **Developer mode** (top-right) → **Load unpacked** → pick **\`uBlock0-MV2\`** on the Desktop. With the patch it loads and runs; on stock Chrome 152 it's refused (\"Manifest version 2 is no longer supported\")."
+            echo "- 👀 **To confirm MV2:** \`chrome://extensions\` should show **uBlock Origin (MV2)** force-installed by policy (\`chrome://policy\` lists ExtensionSettings). If policy is empty, double-click **\`chrome-mv2.mobileconfig\`** on the Desktop and approve it in **System Settings > Profiles**, then relaunch Chrome. One-off alternative: Developer mode → **Load unpacked** → **\`uBlock0-MV2\`**."
             echo "- 🌐 [Open Desktop (browser)](${SESSION_URL})"
             echo "- 🔌 **Native VNC client:** run \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\` locally, then connect your VNC client to \`localhost:5900\`"
             [ -n "$CLIP_URL" ] && echo "- 📋 **Clipboard / files → Mac:** [$CLIP_URL]($CLIP_URL) — paste text to set the Mac clipboard, or upload files to \`~/Downloads\` (anyone with this URL can too)"
