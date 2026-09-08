@@ -1,6 +1,6 @@
 name: macOS MV2 mem-patch testbed
 
-# Builds + installs Sketchystan1/chrome-mv2-patch's macOS in-process MV2 mem-patch
+# Builds + installs the in-repo macOS in-process MV2 mem-patch (mv2-mem-patch-mac/)
 # on a fresh Google Chrome, verifies it, then hands you a VNC desktop (same rig as
 # mac.yml) so you can load a real Manifest V2 extension and confirm it works live.
 
@@ -17,14 +17,6 @@ on:
       MAC_PASSWORD:
         description: 'VNC password (required if not set in Secrets, max 8 chars)'
         required: false
-      PATCH_REPO:
-        description: 'Patch repo (owner/name)'
-        required: false
-        default: 'Sketchystan1/chrome-mv2-patch'
-      PATCH_REF:
-        description: 'Branch, tag or commit of the patch repo to test'
-        required: false
-        default: 'master'
       APPLY_PATCH:
         description: 'Inject + re-sign Chrome (uncheck to only build & offline-inspect)'
         type: boolean
@@ -47,10 +39,11 @@ jobs:
       group: ${{ github.workflow }}-${{ inputs.ARCH }}-${{ github.ref }}
       cancel-in-progress: true
     steps:
+      - name: Check out this repo (for mv2-mem-patch-mac/)
+        uses: actions/checkout@v4
+
       - name: Build & install MV2 mem-patch
         env:
-          PATCH_REPO: ${{ inputs.PATCH_REPO }}
-          PATCH_REF: ${{ inputs.PATCH_REF }}
           APPLY_PATCH: ${{ inputs.APPLY_PATCH }}
           BREW_PACKAGES: ${{ inputs.BREW_PACKAGES }}
         run: |
@@ -83,13 +76,9 @@ jobs:
           CHROME_VER=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' \
             "$CHROME_APP/Contents/Info.plist" 2>/dev/null || echo unknown)
 
-          # --- fetch the patch repo at the requested ref ----------------------
-          echo "⬇️  cloning $PATCH_REPO @ $PATCH_REF ..."
-          git clone "https://github.com/$PATCH_REPO" /tmp/mv2patch
-          git -C /tmp/mv2patch checkout "$PATCH_REF" \
-            || echo "::warning::could not checkout '$PATCH_REF'; staying on the default branch"
-          PATCH_SHA=$(git -C /tmp/mv2patch rev-parse --short HEAD)
-          cd /tmp/mv2patch/mv2-mem-patch-mac
+          # --- the in-repo patch sources (mv2-mem-patch-mac/) ----------------
+          PATCH_SHA="${GITHUB_SHA:0:9}"
+          cd "$GITHUB_WORKSPACE/mv2-mem-patch-mac"
           chmod +x build.sh install.sh
 
           # --- build (universal dylib + offline inspector) --------------------
@@ -111,7 +100,7 @@ jobs:
           printf '%s\n' "$OFFLINE_OUT"
 
           {
-            echo "## 🧩 MV2 mem-patch — \`$PATCH_REPO@$PATCH_SHA\`"
+            echo "## 🧩 MV2 mem-patch — in-repo \`mv2-mem-patch-mac@$PATCH_SHA\`"
             echo "- **Chrome:** \`$CHROME_VER\` (${{ inputs.ARCH }})"
             echo "- **Build:** ✅ universal dylib + inspector built"
             if [ $OFFLINE_RC -eq 0 ]; then
@@ -149,11 +138,11 @@ jobs:
           PY=$(command -v python3 || command -v python)
           # New layout: the code dylib is installed beside the stub as MacOS/mv and
           # loaded via @loader_path/mv (short path so it fits the reclaimed header
-          # room); signatures.json/config.txt stay in Frameworks/mv2/.
+          # room); signatures.json/config.txt stay in Resources/mv2/.
           LOAD_PATH='@loader_path/mv'
           VERIFY_OK=true
 
-          if "$PY" ../scripts/macho_insert_dylib.py present "$LOAD_PATH" "$EXE"; then
+          if "$PY" ./macho_insert_dylib.py present "$LOAD_PATH" "$EXE"; then
             echo "✅ load command injected into the main executable"
           else
             echo "::error::load command NOT present after install"

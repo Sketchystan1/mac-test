@@ -1,0 +1,6 @@
+# Build artifacts (produced by build.sh on the runner)
+mv2-mem-patch.dylib
+mv2-inspect
+__pycache__/
+*.pyc
+config.txt
