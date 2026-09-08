@@ -105,8 +105,9 @@ jobs:
 
           # --- offline inspect (read-only: is this Chrome build covered?) -----
           echo "🔍 ./install.sh --offline ..."
-          OFFLINE_OUT=$(./install.sh --offline "$CHROME_APP" 2>&1)
-          OFFLINE_RC=$?
+          # Capture rc without tripping `bash -e` (GitHub runs steps with -e, so a
+          # bare `VAR=$(failing-cmd)` would abort here before we can report).
+          OFFLINE_OUT=$(./install.sh --offline "$CHROME_APP" 2>&1) && OFFLINE_RC=0 || OFFLINE_RC=$?
           printf '%s\n' "$OFFLINE_OUT"
 
           {
@@ -138,7 +139,7 @@ jobs:
           # --- install (inject LC_LOAD_DYLIB + ad-hoc re-sign) ----------------
           echo "🛠  ./install.sh ..."
           if ! ./install.sh "$CHROME_APP"; then
-            echo "::error::install.sh failed (writability/TCC? see output above)"
+            echo "::error::install.sh failed — see its output above (e.g. 'no room for a load command' = the Chrome executable has no Mach-O header padding to inject into; or an App-Management/TCC write block)"
             echo "- **Install:** ❌ install.sh failed (see logs)" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -272,8 +273,18 @@ jobs:
           # set before any Chrome launch so it is picked up on startup, and it also
           # persists for when you open Chrome by hand in the desktop.
           UBO_ID=fkgkibajhfbepljeaefdnfnegdcjomkh
-          sudo -u "$CONSOLE_USER" defaults write com.google.Chrome ExtensionSettings '{"fkgkibajhfbepljeaefdnfnegdcjomkh" = {"installation_mode" = "normal_installed"; "update_url" = "https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml";};}'
-          echo "🧩 policy: forced MV2 uBlock Origin ($UBO_ID) via ExtensionSettings"
+          # Run `defaults` INSIDE the user's GUI/bootstrap session (same way Chrome
+          # is launched below). A plain `sudo -u "$USER" defaults write` is refused
+          # by cfprefsd here with "Could not write domain com.google.Chrome; exiting".
+          # Non-fatal: the step runs under `bash -e`, and the policy is a convenience
+          # (it also persists for when you open Chrome by hand in the desktop).
+          if sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
+               defaults write com.google.Chrome ExtensionSettings \
+               '{"fkgkibajhfbepljeaefdnfnegdcjomkh" = {"installation_mode" = "normal_installed"; "update_url" = "https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml";};}' 2>/dev/null; then
+            echo "🧩 policy: forced MV2 uBlock Origin ($UBO_ID) via ExtensionSettings"
+          else
+            echo "::warning::could not set ExtensionSettings policy (defaults write refused)"
+          fi
 
           # Resolve the console user's real home (RecordName may be aliased to admin
           # while the home dir stays /Users/<runner>), for the on-disk extension check.
