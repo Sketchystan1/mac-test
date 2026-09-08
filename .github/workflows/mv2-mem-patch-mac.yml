@@ -316,16 +316,35 @@ jobs:
           MV2_EXT="⏭️ open Chrome in the desktop to see whether the MV2 extension loads"
           MV2_DRM="❓ open https://castlabs.github.io/wv-vmp-lab/ in the desktop — it must NOT show \`PLATFORM_TAMPERED\`"
           if [ -x "$CHROME_BIN" ]; then
-            # The ad-hoc re-signed Chrome is an "unidentified developer"; launching it
-            # via LaunchServices (`open`) pops a Gatekeeper dialog that blocks forever
-            # on a headless runner. Disable Gatekeeper assessment + clear the quarantine
-            # xattr so `open` launches it non-interactively.
+            # The ad-hoc re-signed Chrome is an "unidentified developer"; launching via
+            # LaunchServices (`open`) pops a Gatekeeper dialog that blocks forever on a
+            # headless runner. Disable Gatekeeper + clear quarantine for the desktop's
+            # normal-launch path.
             sudo spctl --master-disable 2>/dev/null || true
             sudo xattr -dr com.apple.quarantine "$CHROME_APP" 2>/dev/null || true
-            echo "🧪 runtime check: normal launch via LaunchServices (method=${MV2_INJECT:-dyld}) ..."
+
+            # Diagnostic launch: run the exe DIRECTLY (no Gatekeeper) with debug logging
+            # and, for the dyld method, DYLD_INSERT_LIBRARIES set explicitly (equivalent
+            # to the LSEnvironment a normal launch uses). Redirect stderr INSIDE the user
+            # context so we capture the dylib's [mv2patch] trace and learn whether it
+            # actually flipped the MV2 gates.
+            if [ "${MV2_INJECT:-dyld}" = dyld ]; then
+              ENVV="DYLD_INSERT_LIBRARIES=@executable_path/mv MV2_MEMPATCH_DEBUG=1"
+            else
+              ENVV="MV2_MEMPATCH_DEBUG=1"
+            fi
+            CHROME_LOG=/tmp/chrome-mv2.log
+            sudo rm -f "$CHROME_LOG" 2>/dev/null || true
+            echo "🧪 runtime check: launching Chrome ($ENVV) ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
-              open -a "$CHROME_APP" --args --no-first-run --no-default-browser-check about:blank || true
+              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check about:blank > '$CHROME_LOG' 2>&1" &
             sleep 20
+            sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
+            sudo chmod 644 chrome-mv2.log 2>/dev/null || true
+            echo "----- chrome-mv2.log (Chrome stderr) -----"
+            sed -n '1,40p' chrome-mv2.log 2>/dev/null || true
+            [ -s chrome-mv2.log ] || echo "(empty)"
+            MV2_LOG=$(grep -a '\[mv2patch\]' chrome-mv2.log 2>/dev/null || true)
 
             echo "----- Google Chrome processes -----"
             pgrep -fl 'Contents/MacOS/Google Chrome' 2>/dev/null | head -8 || echo "(no Chrome process running)"
@@ -335,9 +354,15 @@ jobs:
             for p in $(pgrep -f 'Contents/MacOS/Google Chrome' 2>/dev/null); do
               if sudo lsof -p "$p" 2>/dev/null | grep -q '/Contents/MacOS/mv'; then DYLIB_LOADED=true; break; fi
             done
-            if [ "$DYLIB_LOADED" = true ]; then
-              echo "✅ mv2 dylib is mapped into the Chrome browser process"
-              MV2_RUNTIME="✅ dylib loaded into Chrome (\`${MV2_INJECT:-dyld}\` injection)"
+            if printf '%s' "$MV2_LOG" | grep -qi 'ENABLED\|patched in memory'; then
+              echo "✅ [mv2patch] reports the MV2 gates were flipped in memory"
+              MV2_RUNTIME="✅ dylib loaded & MV2 gates patched (\`${MV2_INJECT:-dyld}\`)"
+            elif [ "$DYLIB_LOADED" = true ] && [ -n "$MV2_LOG" ]; then
+              echo "::warning::dylib loaded & logged but did NOT report a gate patch — signatures.json coverage?"
+              MV2_RUNTIME="⚠️ dylib loaded but no gate patched (see [mv2patch] / signatures.json)"
+            elif [ "$DYLIB_LOADED" = true ]; then
+              echo "✅ dylib mapped into Chrome (no debug trace captured)"
+              MV2_RUNTIME="✅ dylib loaded (\`${MV2_INJECT:-dyld}\`); patch trace not captured"
             elif pgrep -f 'Contents/MacOS/Google Chrome' >/dev/null 2>&1; then
               echo "::warning::Chrome is running but the mv2 dylib is not mapped — injection didn't take"
               MV2_RUNTIME="⚠️ Chrome runs but dylib not injected — verify in the desktop"
