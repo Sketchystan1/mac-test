@@ -321,6 +321,14 @@ jobs:
             [ -s chrome-mv2.log ] || echo "(chrome-mv2.log is EMPTY)"
             echo "----- Google Chrome processes -----"
             pgrep -fl 'Google Chrome' 2>/dev/null | head -8 || echo "(no Chrome process running)"
+            echo "----- codesign -dvvv (main exe) -----"
+            codesign -dvvv "$CHROME_BIN" 2>&1 | grep -iE "Signature|Authority|flags=|CodeDirectory|Identifier|TeamIdent|Runtime|linker-signed" | head -20
+            echo "----- entitlements on main exe -----"
+            codesign -d --entitlements - --xml "$CHROME_BIN" 2>/dev/null | tr -d '\000' | grep -iE "disable-library|unsigned-exec|com\.apple\.security" | head -20
+            echo "----- AMFI / code-signing kill reason (last 2m) -----"
+            sudo log show --last 2m 2>/dev/null \
+              | grep -iE "google chrome|amfi|library validation|code signature|invalid signat|cs_invalid|killed:|taskgated|not valid" \
+              | grep -viE "screensharing|cloudflared|noVNC|novnc" | tail -30
             echo "---------------------------------------------------------"
 
             if [ "$PATCH_ACTIVE" = true ]; then
