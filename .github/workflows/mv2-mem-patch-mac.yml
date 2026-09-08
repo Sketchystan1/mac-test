@@ -291,19 +291,23 @@ jobs:
           UBO_SRC=""
           UBO_DIR=/tmp/ubo
           rm -rf "$UBO_DIR"; mkdir -p "$UBO_DIR"
-          UBO_URL=$(curl -fsSL https://api.github.com/repos/gorhill/uBlock/releases/latest 2>/dev/null \
-                    | grep -o 'https://[^"]*\.chromium\.zip' | head -1)
-          if [ -n "$UBO_URL" ] && curl -fsSL "$UBO_URL" -o /tmp/ubo.zip 2>/dev/null \
-               && unzip -oq /tmp/ubo.zip -d "$UBO_DIR" 2>/dev/null; then
-            UBO_SRC="$(dirname "$(find "$UBO_DIR" -name manifest.json 2>/dev/null | head -1)")"
-            if [ -f "$UBO_SRC/manifest.json" ]; then
-              MFV="$(grep -o '"manifest_version"[^,]*' "$UBO_SRC/manifest.json" | head -1)"
-              echo "🧩 uBlock MV2 build → $UBO_SRC ($MFV) from $(basename "$UBO_URL")"
-            else
-              UBO_SRC=""
+          # Get the version from gorhill's update manifest (raw.githubusercontent — no
+          # api.github.com rate limit) and build the .chromium.zip release URL from it.
+          UBO_VER=$(curl -fsSL https://raw.githubusercontent.com/gorhill/uBlock/master/dist/chromium/update.xml 2>/dev/null \
+                    | grep -o 'version="[0-9.]*"' | head -1 | grep -o '[0-9.]*')
+          if [ -n "$UBO_VER" ]; then
+            UBO_ZIP="https://github.com/gorhill/uBlock/releases/download/$UBO_VER/uBlock0_$UBO_VER.chromium.zip"
+            if curl -fsSL "$UBO_ZIP" -o /tmp/ubo.zip 2>/dev/null && unzip -oq /tmp/ubo.zip -d "$UBO_DIR" 2>/dev/null; then
+              UBO_SRC="$(dirname "$(find "$UBO_DIR" -name manifest.json 2>/dev/null | head -1)")"
+              [ -f "$UBO_SRC/manifest.json" ] || UBO_SRC=""
             fi
           fi
-          [ -z "$UBO_SRC" ] && echo "::warning::could not fetch the uBlock MV2 build"
+          if [ -n "$UBO_SRC" ]; then
+            MFV="$(grep -o '"manifest_version"[^,]*' "$UBO_SRC/manifest.json" | head -1)"
+            echo "🧩 uBlock MV2 build v$UBO_VER → $UBO_SRC ($MFV)"
+          else
+            echo "::warning::could not fetch the uBlock MV2 build (ver='$UBO_VER')"
+          fi
 
           # macOS equivalent of Windows' HKLM\Software\Policies\Google\Chrome +
           # ExtensionSettings. macOS has no registry; Chrome reads MANDATORY (forced)
@@ -463,9 +467,12 @@ jobs:
             CHROME_LOG=/tmp/chrome-mv2.log
             sudo rm -f "$CHROME_LOG" 2>/dev/null || true
             sudo -u "$CONSOLE_USER" rm -f "$CONSOLE_HOME/Library/Logs/DiagnosticReports/"*.ips 2>/dev/null || true
+            # Verbose extension-updater / policy logging so we can see WHY a
+            # force_installed policy extension is or isn't fetched + installed.
+            LOGFLAGS="--enable-logging=stderr --v=1 --vmodule=extension_updater=2,extension_downloader=2,external_provider_impl=2,extension_service=2,crx_installer=2,install_stage_tracker=2,extension_management=2,manifest_v2_experiment_manager=2"
             echo "🧪 runtime check: launching Chrome ($ENVV) → loading a real page ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
-              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check https://example.com > '$CHROME_LOG' 2>&1" &
+              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check $LOGFLAGS https://example.com > '$CHROME_LOG' 2>&1" &
             sleep 20
             sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
             sudo chmod 644 chrome-mv2.log 2>/dev/null || true
@@ -525,6 +532,11 @@ jobs:
             else
               MV2_EXT="⚠️ couldn't stage uBlock — download uBlock Origin's chromium build and Load unpacked it in the desktop"
             fi
+
+            echo "----- extension force-install trace (Chrome updater/policy log) -----"
+            sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
+            sudo chmod 644 chrome-mv2.log 2>/dev/null || true
+            grep -aiE "forcelist|force_installed|external.provider|extension_updater|extension_downloader|update.manifest|\.crx|manifest.version|manifest_v2|not allowed|is disabled|blocklist|install.stage|CrxInstall|CRX_|from policy|failed to" chrome-mv2.log 2>/dev/null | tail -50 || echo "(no matching lines)"
 
             # DRM gate: open the castLabs Widevine VMP lab so it's ready to inspect.
             # Widevine provisioning may need a moment on a fresh Chrome; verify in the
