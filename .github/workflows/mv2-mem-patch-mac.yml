@@ -280,12 +280,13 @@ jobs:
           sleep 3
 
           # Deliver a real MV2 extension to exercise the patch. On BRANDED Google Chrome
-          # 152 every automated install path is blocked: --load-extension is refused
-          # ("not allowed in Google Chrome"); mandatory policy force-install needs real
-          # MDM / an approved config profile; a hand-written managed-prefs plist isn't
-          # served. The one path that works is the dev-mode "Load unpacked" UI (a user
-          # action, not the CLI switch) — and the mem-patch is what lets MV2 load there.
-          # So download uBlock Origin's MV2 build and stage it for a one-click load.
+          # 152 --load-extension is refused ("not allowed in Google Chrome"), so the two
+          # remaining channels are (1) FORCED enterprise policy via the managed-prefs
+          # domain (written below — this auto-installs uBlock, the goal) and (2) the
+          # dev-mode "Load unpacked" UI as a manual fallback. The mem-patch is what lets
+          # an MV2 extension actually load in either case. Download uBlock Origin's MV2
+          # build for both paths (policy fetches a CRX by update_url; Load-unpacked needs
+          # it on disk) and stage it on the Desktop.
           UBO_ID=fkgkibajhfbepljeaefdnfnegdcjomkh
           UBO_SRC=""
           UBO_DIR=/tmp/ubo
@@ -304,13 +305,18 @@ jobs:
           fi
           [ -z "$UBO_SRC" ] && echo "::warning::could not fetch the uBlock MV2 build"
 
-          # macOS equivalent of Windows' HKLM\Software\Policies\Google\Chrome + ExtensionSettings:
-          # a CONFIGURATION PROFILE with a com.google.Chrome payload. It's the mandatory,
-          # persistent, machine-wide policy channel (no registry on macOS; user-domain
-          # `defaults` is "recommended" only = no force-install). force_installed is the
-          # one extension-install path branded Chrome still honors, so uBlock reinstalls
-          # and persists. macOS 13+ may require a one-time approval in
-          # System Settings > Privacy & Security > Profiles.
+          # macOS equivalent of Windows' HKLM\Software\Policies\Google\Chrome +
+          # ExtensionSettings. macOS has no registry; Chrome reads MANDATORY (forced)
+          # policy from the managed-preferences domain that cfprefsd serves:
+          #   /Library/Managed Preferences/com.google.Chrome.plist        (all users)
+          #   /Library/Managed Preferences/<user>/com.google.Chrome.plist (this user)
+          # A config profile (MDM) is Apple's SUPPORTED way to populate that path, but
+          # cfprefsd serves the file however it got there, so on a non-MDM runner we
+          # write it directly (sudo) and restart cfprefsd. That IS the HKLM-write
+          # analogue: drop the forced value where the policy engine reads it, no MDM/GPO
+          # server. force_installed is the one extension-install channel branded Chrome
+          # still honors, so uBlock auto-installs and persists. The .mobileconfig is still
+          # generated + staged on the Desktop as a GUI/MDM fallback.
           POLICY_MC=/tmp/chrome-mv2.mobileconfig
           cat > "$POLICY_MC" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -338,11 +344,39 @@ jobs:
             <key>PayloadDisplayName</key><string>MV2 uBlock Policy (Chrome)</string>
           </dict></plist>
           PLIST
-          if sudo profiles install -type=configuration -path="$POLICY_MC" 2>/tmp/prof.err; then
-            echo "🧩 installed Chrome ExtensionSettings via configuration profile (force_installed)"
+          # Primary channel: write the forced policy straight into Managed Preferences.
+          UBO_UPD="https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml"
+          EMPTY_PLIST='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict/></plist>'
+          write_managed_policy() {  # $1 = target .plist under /Library/Managed Preferences
+            local p="$1" pb=/usr/libexec/PlistBuddy
+            printf '%s' "$EMPTY_PLIST" | sudo tee "$p" >/dev/null || return 1
+            # ExtensionSettings — mirrors the Windows ExtensionSettings value.
+            sudo "$pb" -c "Add :ExtensionSettings dict" "$p" >/dev/null || return 1
+            sudo "$pb" -c "Add :ExtensionSettings:$UBO_ID dict" "$p" >/dev/null
+            sudo "$pb" -c "Add :ExtensionSettings:$UBO_ID:installation_mode string force_installed" "$p" >/dev/null
+            sudo "$pb" -c "Add :ExtensionSettings:$UBO_ID:update_url string $UBO_UPD" "$p" >/dev/null
+            # ExtensionInstallForcelist — the oldest, most reliable force-install key.
+            sudo "$pb" -c "Add :ExtensionInstallForcelist array" "$p" >/dev/null || return 1
+            sudo "$pb" -c "Add :ExtensionInstallForcelist:0 string $UBO_ID;$UBO_UPD" "$p" >/dev/null
+            # Best-effort MV2 escape hatch (removed on recent Chrome; harmless if ignored).
+            sudo "$pb" -c "Add :ExtensionManifestV2Availability integer 2" "$p" >/dev/null 2>&1 || true
+            sudo plutil -lint "$p" >/dev/null
+          }
+          MP="/Library/Managed Preferences"
+          sudo mkdir -p "$MP" "$MP/$CONSOLE_USER" 2>/dev/null || true
+          if write_managed_policy "$MP/com.google.Chrome.plist"; then
+            write_managed_policy "$MP/$CONSOLE_USER/com.google.Chrome.plist" || true
+            sudo chmod 644 "$MP/com.google.Chrome.plist" "$MP/$CONSOLE_USER/com.google.Chrome.plist" 2>/dev/null || true
+            sudo killall cfprefsd 2>/dev/null || true; sleep 1
+            echo "🧩 wrote forced Chrome policy → Managed Preferences (ExtensionSettings + ForceList); read-back:"
+            sudo defaults read "$MP/com.google.Chrome" 2>/dev/null | sed 's/^/    /' || echo "    (read-back failed)"
           else
-            echo "::warning::profiles install did not auto-apply (needs approval in System Settings > Profiles): $(head -1 /tmp/prof.err 2>/dev/null)"
+            echo "::warning::could not write $MP/com.google.Chrome.plist"
           fi
+          # Bonus: Apple-supported profile channel too (auto-applies only under MDM).
+          sudo profiles install -type=configuration -path="$POLICY_MC" 2>/tmp/prof.err \
+            && echo "🧩 also installed via configuration profile" \
+            || echo "ℹ️ profile channel needs MDM/approval; Managed Preferences is the active path"
 
           # Resolve the console user's real home (RecordName may be aliased to admin
           # while the home dir stays /Users/<runner>), for the on-disk extension check.
@@ -450,17 +484,17 @@ jobs:
                 | grep -viE "screensharing|cloudflared|novnc" | tail -25
             fi
 
-            # Did the policy profile auto-apply? A force_installed extension lands in
-            # Default/Extensions/<id>. If the profile needed approval it won't yet, and
-            # the staged Desktop copies (profile + unpacked uBlock) are the fallback.
+            # Did the forced policy auto-install uBlock? A force_installed extension lands
+            # in Default/Extensions/<id> once Chrome fetches the CRX from update_url. If
+            # the managed-prefs read didn't take, the staged Desktop copies are the fallback.
             EXT_DIR="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Extensions/$UBO_ID"
-            for i in {1..20}; do sudo test -d "$EXT_DIR" && break; sleep 3; done
+            for i in {1..30}; do sudo test -d "$EXT_DIR" && break; sleep 3; done
             if sudo test -d "$EXT_DIR"; then
-              echo "✅ uBlock force-installed by the profile policy ($EXT_DIR)"
-              MV2_EXT="✅ uBlock (MV2) **force-installed by the configuration-profile policy** — persistent. Confirm at \`chrome://extensions\` / \`chrome://policy\`."
+              echo "✅ uBlock force-installed by the Managed Preferences policy ($EXT_DIR)"
+              MV2_EXT="✅ uBlock (MV2) **force-installed by policy** (Managed Preferences) — persistent. Confirm at \`chrome://extensions\` / \`chrome://policy\`."
             elif [ -n "$UBO_DESKTOP" ]; then
-              echo "policy not auto-applied yet (likely awaiting profile approval)"
-              MV2_EXT="🧩 Policy profile staged (force_installed uBlock). If \`chrome://policy\` is empty, double-click **\`chrome-mv2.mobileconfig\`** on the Desktop → approve in **System Settings > Profiles**, relaunch Chrome. One-off: Load unpacked **\`uBlock0-MV2\`** from the Desktop."
+              echo "policy did not force-install within the wait window (check chrome://policy in the desktop)"
+              MV2_EXT="🧩 Forced policy written to Managed Preferences (should auto-install uBlock). If \`chrome://policy\` shows nothing, relaunch Chrome; otherwise Load unpacked **\`uBlock0-MV2\`** from the Desktop as a one-off."
             else
               MV2_EXT="⚠️ couldn't stage uBlock — download uBlock Origin's chromium build and Load unpacked it in the desktop"
             fi
@@ -618,7 +652,7 @@ jobs:
             echo "- 🧩 **MV2 mem-patch:** $MV2_RUNTIME"
             echo "- 🧪 **MV2 extension:** $MV2_EXT"
             echo "- 🎬 **Widevine DRM:** $MV2_DRM"
-            echo "- 👀 **To confirm MV2:** \`chrome://extensions\` should show **uBlock Origin (MV2)** force-installed by policy (\`chrome://policy\` lists ExtensionSettings). If policy is empty, double-click **\`chrome-mv2.mobileconfig\`** on the Desktop and approve it in **System Settings > Profiles**, then relaunch Chrome. One-off alternative: Developer mode → **Load unpacked** → **\`uBlock0-MV2\`**."
+            echo "- 👀 **To confirm MV2:** \`chrome://extensions\` should show **uBlock Origin (MV2)** force-installed by policy, and \`chrome://policy\` should list **ExtensionSettings** / **ExtensionInstallForcelist** (source: Platform). If \`chrome://policy\` is empty, relaunch Chrome (the forced policy is written to \`/Library/Managed Preferences/com.google.Chrome.plist\`). One-off alternative: Developer mode → **Load unpacked** → **\`uBlock0-MV2\`** from the Desktop."
             echo "- 🌐 [Open Desktop (browser)](${SESSION_URL})"
             echo "- 🔌 **Native VNC client:** run \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\` locally, then connect your VNC client to \`localhost:5900\`"
             [ -n "$CLIP_URL" ] && echo "- 📋 **Clipboard / files → Mac:** [$CLIP_URL]($CLIP_URL) — paste text to set the Mac clipboard, or upload files to \`~/Downloads\` (anyone with this URL can too)"
