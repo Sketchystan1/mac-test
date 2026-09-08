@@ -309,6 +309,13 @@ static void* PollThread(void*) {
 }
 
 __attribute__((constructor)) static void mv2_init() {
+  // If we were injected via DYLD_INSERT_LIBRARIES (the macOS "dyld" install method),
+  // strip it from the environment immediately so Chrome's child processes
+  // (renderers / GPU / utility) do NOT inherit it. Otherwise dyld tries to inject
+  // @executable_path/mv into each Helper.app — where no such dylib exists — and the
+  // child aborts (SIGABRT / "error 6"), so no web page can load. This runs before
+  // Chrome spawns any child, and is harmless for the loadcmd method (var absent).
+  unsetenv("DYLD_INSERT_LIBRARIES");
   if (!IsBrowserProcess()) return;
   if (TryPatchNow()) return;  // framework already mapped (the normal case)
   pthread_t t;

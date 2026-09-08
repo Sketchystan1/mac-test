@@ -354,7 +354,7 @@ jobs:
 
             echo "----- recent crash reports (which process crashed & why) -----"
             CR_DIR="$CONSOLE_HOME/Library/Logs/DiagnosticReports"
-            for f in $(sudo ls -t "$CR_DIR"/*.ips 2>/dev/null | head -4); do
+            sudo find "$CR_DIR" -name '*.ips' 2>/dev/null | sort | tail -4 | while IFS= read -r f; do
               echo "=== $(basename "$f") ==="
               sudo sed -n '1,30p' "$f" 2>/dev/null \
                 | grep -iE '"procName"|"exceptionType"|"signal"|"termination"|reason|"role"|dyld|Library not loaded|not valid|code sign' | head -12
