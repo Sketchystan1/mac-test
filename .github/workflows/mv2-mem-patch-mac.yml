@@ -195,7 +195,7 @@ jobs:
         # is still marked failed by the patch step, preserving the test signal.
         if: ${{ !cancelled() }}
         env:
-          MAC_PASSWORD: ${{ secrets.MAC_PASSWORD || inputs.MAC_PASSWORD }}
+          MAC_PASSWORD: ${{ secrets.MAC_PASSWORD || secrets.VNC_PASSWORD || inputs.MAC_PASSWORD }}
           MV2_INJECT: ${{ inputs.INJECT_METHOD }}
           SMOKE_TEST: ${{ inputs.SMOKE_TEST }}
           ARCH: ${{ inputs.ARCH }}
