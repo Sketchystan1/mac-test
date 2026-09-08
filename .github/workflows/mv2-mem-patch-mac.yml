@@ -263,6 +263,23 @@ jobs:
           sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" open -a Finder 2>/dev/null || true
           sleep 3
 
+          # Force-install a real Manifest V2 extension (legacy uBlock Origin) from
+          # its off-store update_url via Chrome's ExtensionSettings policy, so the
+          # session boots with an MV2 extension already requested. On stock Chrome
+          # MV2 is disabled ("no longer supported"); with the mem-patch it should
+          # stay ENABLED — that enabled state is the real end-to-end test. Written
+          # to the console user's own domain (that's the uid Chrome runs as here);
+          # set before any Chrome launch so it is picked up on startup, and it also
+          # persists for when you open Chrome by hand in the desktop.
+          UBO_ID=fkgkibajhfbepljeaefdnfnegdcjomkh
+          sudo -u "$CONSOLE_USER" defaults write com.google.Chrome ExtensionSettings '{"fkgkibajhfbepljeaefdnfnegdcjomkh" = {"installation_mode" = "normal_installed"; "update_url" = "https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml";};}'
+          echo "🧩 policy: forced MV2 uBlock Origin ($UBO_ID) via ExtensionSettings"
+
+          # Resolve the console user's real home (RecordName may be aliased to admin
+          # while the home dir stays /Users/<runner>), for the on-disk extension check.
+          CONSOLE_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+          [ -n "$CONSOLE_HOME" ] || CONSOLE_HOME="/Users/$CONSOLE_USER"
+
           # Runtime check: launch the patched Chrome in the GUI session with debug
           # logging on. The dylib's DBG() traces go to *stderr* (fprintf), not the
           # unified log, so we capture Chrome's stderr to chrome-mv2.log and grep
@@ -271,6 +288,7 @@ jobs:
           #   [mv2patch] MV2 extensions ENABLED - <milestone>, N gate(s) patched in memory
           # Best-effort - GUI launch timing on CI is flaky, so this warns, never fails.
           MV2_RUNTIME="⏭️ patch not applied — Chrome is stock (APPLY_PATCH=false, or the build step didn't install it)"
+          MV2_EXT="⏭️ forced MV2 uBlock Origin policy is set — open Chrome in the desktop to see it load"
           if [ -d "/Applications/Google Chrome.app/Contents/Frameworks/mv2" ]; then
             echo "🧪 runtime check: launching patched Chrome with MV2_MEMPATCH_DEBUG=1 ..."
             CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -297,6 +315,20 @@ jobs:
             else
               echo "::warning::no [mv2patch] markers seen yet (Chrome may still be warming up) — verify in the desktop"
               MV2_RUNTIME="⚠️ no \`[mv2patch]\` markers seen yet — verify manually in the desktop"
+            fi
+
+            # Did the forced MV2 extension actually land on disk? (needs network + a moment)
+            EXT_DIR="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Extensions/$UBO_ID"
+            for i in {1..20}; do
+              sudo test -d "$EXT_DIR" && break
+              sleep 3
+            done
+            if sudo test -d "$EXT_DIR"; then
+              echo "✅ MV2 uBlock Origin installed on disk"
+              MV2_EXT="✅ MV2 uBlock Origin installed — open \`chrome://extensions\` and confirm it's **enabled** (not blocked)"
+            else
+              echo "::warning::MV2 extension not on disk yet — verify in the desktop (chrome://extensions)"
+              MV2_EXT="⚠️ MV2 uBlock Origin not on disk yet — check \`chrome://extensions\` in the desktop"
             fi
           fi
 
@@ -341,7 +373,8 @@ jobs:
           {
             echo "### macOS ${{ inputs.ARCH }} — MV2 testbed"
             echo "- 🧩 **MV2 mem-patch:** $MV2_RUNTIME"
-            echo "- 🧪 **To test:** open **Google Chrome** → \`chrome://extensions\` → enable *Developer mode* → *Load unpacked* a **Manifest V2** extension. It should load instead of showing the \"no longer supported\" block."
+            echo "- 🧪 **MV2 extension:** $MV2_EXT"
+            echo "- 👀 **To confirm:** open **Google Chrome** → \`chrome://extensions\`. The force-installed **uBlock Origin (MV2)** should be present and **enabled** — on unpatched Chrome it would be blocked with \"no longer supported\". (\`chrome://policy\` shows the applied ExtensionSettings policy.)"
             echo "- 🌐 [Open Desktop (browser)](${SESSION_URL})"
             echo "- 🔌 **Native VNC client:** run \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\` locally, then connect your VNC client to \`localhost:5900\`"
             echo "- 👤 **Username:** \`$CONSOLE_USER\`"
