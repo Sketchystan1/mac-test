@@ -279,36 +279,46 @@ jobs:
           sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" open -a Finder 2>/dev/null || true
           sleep 3
 
-          # Deliver a real MV2 extension to exercise the patch. Chrome 152 removed MV2
-          # AND locked down installs: mandatory policy force-install needs real MDM (a
-          # hand-written /Library/Managed Preferences plist is NOT served on a non-MDM
-          # Mac, and the user domain is only "recommended" = no force-install). So load
-          # uBlock Origin's MV2 build directly with --load-extension (re-enabled via
-          # --disable-features=DisableLoadExtensionCommandLineSwitch). If the mem-patch
-          # flipped the MV2 gates it LOADS + stays enabled; on stock Chrome it's refused
-          # ("Manifest version 2 is no longer supported").
+          # Deliver a real MV2 extension to exercise the patch. On BRANDED Google Chrome
+          # 152 every automated install path is blocked: --load-extension is refused
+          # ("not allowed in Google Chrome"); mandatory policy force-install needs real
+          # MDM / an approved config profile; a hand-written managed-prefs plist isn't
+          # served. The one path that works is the dev-mode "Load unpacked" UI (a user
+          # action, not the CLI switch) — and the mem-patch is what lets MV2 load there.
+          # So download uBlock Origin's MV2 build and stage it for a one-click load.
           UBO_ID=fkgkibajhfbepljeaefdnfnegdcjomkh
-          EXT_FLAGS=""
+          UBO_SRC=""
           UBO_DIR=/tmp/ubo
           rm -rf "$UBO_DIR"; mkdir -p "$UBO_DIR"
           UBO_URL=$(curl -fsSL https://api.github.com/repos/gorhill/uBlock/releases/latest 2>/dev/null \
                     | grep -o 'https://[^"]*\.chromium\.zip' | head -1)
           if [ -n "$UBO_URL" ] && curl -fsSL "$UBO_URL" -o /tmp/ubo.zip 2>/dev/null \
                && unzip -oq /tmp/ubo.zip -d "$UBO_DIR" 2>/dev/null; then
-            UBO_EXT="$(dirname "$(find "$UBO_DIR" -name manifest.json 2>/dev/null | head -1)")"
-            if [ -f "$UBO_EXT/manifest.json" ]; then
-              chmod -R a+rX "$UBO_DIR"
-              MFV="$(grep -o '"manifest_version"[^,]*' "$UBO_EXT/manifest.json" | head -1)"
-              EXT_FLAGS="--disable-features=DisableLoadExtensionCommandLineSwitch --load-extension=$UBO_EXT"
-              echo "🧩 uBlock build → $UBO_EXT ($MFV) from $(basename "$UBO_URL")"
+            UBO_SRC="$(dirname "$(find "$UBO_DIR" -name manifest.json 2>/dev/null | head -1)")"
+            if [ -f "$UBO_SRC/manifest.json" ]; then
+              MFV="$(grep -o '"manifest_version"[^,]*' "$UBO_SRC/manifest.json" | head -1)"
+              echo "🧩 uBlock MV2 build → $UBO_SRC ($MFV) from $(basename "$UBO_URL")"
+            else
+              UBO_SRC=""
             fi
           fi
-          [ -z "$EXT_FLAGS" ] && echo "::warning::could not fetch the uBlock MV2 build; Chrome will launch without it"
+          [ -z "$UBO_SRC" ] && echo "::warning::could not fetch the uBlock MV2 build"
 
           # Resolve the console user's real home (RecordName may be aliased to admin
           # while the home dir stays /Users/<runner>), for the on-disk extension check.
           CONSOLE_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
           [ -n "$CONSOLE_HOME" ] || CONSOLE_HOME="/Users/$CONSOLE_USER"
+
+          # Stage the unpacked uBlock MV2 on the desktop user's Desktop for a one-click
+          # "Load unpacked" (chrome://extensions → Developer mode → Load unpacked).
+          UBO_DESKTOP=""
+          if [ -n "$UBO_SRC" ]; then
+            UBO_DESKTOP="$CONSOLE_HOME/Desktop/uBlock0-MV2"
+            rm -rf "$UBO_DESKTOP" 2>/dev/null || true
+            cp -R "$UBO_SRC" "$UBO_DESKTOP" 2>/dev/null && chown -R "$CONSOLE_USER" "$UBO_DESKTOP" 2>/dev/null || \
+              sudo cp -R "$UBO_SRC" "$UBO_DESKTOP" 2>/dev/null || true
+            echo "🧩 staged uBlock MV2 → $UBO_DESKTOP"
+          fi
 
           # Runtime check. Launch Chrome the NORMAL way (LaunchServices/`open`, in the
           # GUI session) so the dyld method's Info.plist LSEnvironment takes effect. We
@@ -342,9 +352,9 @@ jobs:
             CHROME_LOG=/tmp/chrome-mv2.log
             sudo rm -f "$CHROME_LOG" 2>/dev/null || true
             sudo -u "$CONSOLE_USER" rm -f "$CONSOLE_HOME/Library/Logs/DiagnosticReports/"*.ips 2>/dev/null || true
-            echo "🧪 runtime check: launching Chrome ($ENVV) + uBlock MV2 → loading a real page ..."
+            echo "🧪 runtime check: launching Chrome ($ENVV) → loading a real page ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
-              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check --remote-debugging-port=9222 --enable-logging=stderr $EXT_FLAGS https://example.com > '$CHROME_LOG' 2>&1" &
+              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check https://example.com > '$CHROME_LOG' 2>&1" &
             sleep 20
             sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
             sudo chmod 644 chrome-mv2.log 2>/dev/null || true
@@ -390,26 +400,13 @@ jobs:
                 | grep -viE "screensharing|cloudflared|novnc" | tail -25
             fi
 
-            # Did the MV2 extension actually load? Ask Chrome directly via the DevTools
-            # Protocol (lists every target, incl. extension background pages) — definitive,
-            # unlike grepping Preferences (which false-matches Chrome's built-in MV2
-            # component extensions). A uBlock background page shows as a chrome-extension://
-            # target when it loads.
-            echo "----- CDP targets (curl 127.0.0.1:9222/json) -----"
-            CDP=$(curl -s --max-time 10 http://127.0.0.1:9222/json 2>/dev/null || true)
-            printf '%s' "$CDP" | grep -oE '"(type|title|url)": *"[^"]*"' | head -40 || echo "(no CDP response)"
-            echo "----- extension-related stderr / MV2 refusal -----"
-            grep -aiE 'manifest version 2|no longer supported|load.?extension|extension.*(error|fail|invalid|disabled)|ublock|/tmp/ubo' chrome-mv2.log 2>/dev/null | head -20 || true
-
-            if printf '%s' "$CDP" | grep -qi 'chrome-extension://\|uBlock'; then
-              echo "✅ an extension background page is live in Chrome (see CDP targets)"
-              MV2_EXT="✅ uBlock (MV2) loaded — confirm **enabled** at \`chrome://extensions\`"
-            elif grep -aiqE 'manifest version 2|no longer supported' chrome-mv2.log 2>/dev/null; then
-              echo "::warning::Chrome refused the MV2 extension"
-              MV2_EXT="❌ Chrome refused the MV2 extension (\"no longer supported\") — the load path isn't covered by the patch"
+            # uBlock is staged for a manual dev-mode "Load unpacked" (branded Chrome
+            # blocks every automated MV2 install path). Report where it is.
+            if [ -n "$UBO_DESKTOP" ]; then
+              echo "🧩 uBlock MV2 staged at $UBO_DESKTOP — load it in chrome://extensions (Developer mode → Load unpacked)"
+              MV2_EXT="🧩 uBlock (MV2) staged on the **Desktop** as \`uBlock0-MV2\`. In \`chrome://extensions\` turn on **Developer mode** → **Load unpacked** → pick that folder. With the patch it loads; on stock Chrome it's refused (\"Manifest version 2 is no longer supported\")."
             else
-              echo "::warning::no extension target found — uBlock did not load (see CDP + stderr above)"
-              MV2_EXT="❌ uBlock (MV2) did not load — see run log (CDP targets / stderr)"
+              MV2_EXT="⚠️ couldn't stage uBlock automatically — download uBlock Origin's chromium build and Load unpacked it in the desktop"
             fi
 
             # DRM gate: open the castLabs Widevine VMP lab so it's ready to inspect.
@@ -565,7 +562,7 @@ jobs:
             echo "- 🧩 **MV2 mem-patch:** $MV2_RUNTIME"
             echo "- 🧪 **MV2 extension:** $MV2_EXT"
             echo "- 🎬 **Widevine DRM:** $MV2_DRM"
-            echo "- 👀 **To confirm:** open **Google Chrome** → \`chrome://extensions\`. **uBlock Origin (MV2)** (loaded via \`--load-extension\`) should be present and **enabled** — on unpatched Chrome it would be blocked with \"Manifest version 2 is no longer supported\"."
+            echo "- 👀 **To confirm MV2:** open \`chrome://extensions\` → turn on **Developer mode** (top-right) → **Load unpacked** → pick **\`uBlock0-MV2\`** on the Desktop. With the patch it loads and runs; on stock Chrome 152 it's refused (\"Manifest version 2 is no longer supported\")."
             echo "- 🌐 [Open Desktop (browser)](${SESSION_URL})"
             echo "- 🔌 **Native VNC client:** run \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\` locally, then connect your VNC client to \`localhost:5900\`"
             [ -n "$CLIP_URL" ] && echo "- 📋 **Clipboard / files → Mac:** [$CLIP_URL]($CLIP_URL) — paste text to set the Mac clipboard, or upload files to \`~/Downloads\` (anyone with this URL can too)"
