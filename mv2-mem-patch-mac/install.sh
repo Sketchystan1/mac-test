@@ -97,20 +97,22 @@ EOF
 # Build a merged entitlements plist: the source binary's own entitlements plus our
 # two keys. Reads from the STOCK executable (clean signature). Falls back to the
 # shipped entitlements.plist / an empty dict if read-back is unavailable.
-merge_entitlements() {  # src_macho out_plist
-  local src="$1" out="$2" k
-  if ! { codesign -d --entitlements - --xml "$src" 2>/dev/null > "$out" \
-         && [ -s "$out" ] && plutil -lint "$out" >/dev/null 2>&1; }; then
-    if [ -f "$SCRIPT_DIR/entitlements.plist" ]; then
-      cp "$SCRIPT_DIR/entitlements.plist" "$out"
-    else
-      printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-        '<plist version="1.0"><dict/></plist>' > "$out"
-    fi
-  fi
+# Emit a MINIMAL entitlements plist carrying ONLY our two hardened-runtime
+# exceptions. We deliberately do NOT copy Chrome's own entitlements: they include
+# restricted, Team-ID-bound keys (com.apple.application-identifier, keychain-access-
+# groups, com.apple.developer.*) and AMFI SIGKILLs any *ad-hoc* signed binary that
+# carries restricted entitlements ("adhoc signed but contains restricted
+# entitlements", codesign --verify won't catch it). Our two cs.* keys are not
+# restricted. The re-sign is also non-hardened, so library validation / executable-
+# memory limits don't apply anyway; the keys are belt-and-suspenders. Dropping
+# Chrome's keychain-access-groups etc. degrades some features (saved-password
+# keychain, associated-domains) but Chrome launches and runs extensions.
+merge_entitlements() {  # (src ignored) out_plist
+  local out="$2" k
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0"><dict/></plist>' > "$out"
   for k in "${ENT_KEYS[@]}"; do
-    /usr/libexec/PlistBuddy -c "Delete :$k" "$out" 2>/dev/null
     /usr/libexec/PlistBuddy -c "Add :$k bool true" "$out" >/dev/null 2>&1 \
       || die "could not edit entitlements plist"
   done
