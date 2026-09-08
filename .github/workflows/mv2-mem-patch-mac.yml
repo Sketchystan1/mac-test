@@ -291,44 +291,52 @@ jobs:
           CONSOLE_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
           [ -n "$CONSOLE_HOME" ] || CONSOLE_HOME="/Users/$CONSOLE_USER"
 
-          # Runtime check: launch the patched Chrome in the GUI session with debug
-          # logging on. The dylib's DBG() traces go to *stderr* (fprintf), not the
-          # unified log, so we capture Chrome's stderr to chrome-mv2.log and grep
-          # that; `log show` is only a fallback (launchd sometimes mirrors a GUI
-          # app's stderr there). The success trace is
+          # Runtime check. Launch Chrome once in the GUI session with debug logging
+          # on (harmless if unpatched): this makes the dylib log if it is actually
+          # loaded, and lets the ExtensionSettings policy take effect so we can see
+          # whether the MV2 extension installs. Chrome stays up for you in the desktop.
+          #
+          # "Patched" is decided by the *real* load command in the executable (otool),
+          # NOT by the Frameworks/mv2 dir — install.sh copies the dylib there BEFORE it
+          # injects, so a failed install leaves the dir behind with no load command.
+          #
+          # The dylib's DBG() traces go to *stderr* (fprintf), which we capture to
+          # chrome-mv2.log. We do NOT fall back to `log show`: a predicate containing
+          # "[mv2patch]" gets echoed into log show's own audit entry, so grepping its
+          # output self-matches and yields a false positive. Success trace:
           #   [mv2patch] MV2 extensions ENABLED - <milestone>, N gate(s) patched in memory
           # Best-effort - GUI launch timing on CI is flaky, so this warns, never fails.
-          MV2_RUNTIME="⏭️ patch not applied — Chrome is stock (APPLY_PATCH=false, or the build step didn't install it)"
-          MV2_EXT="⏭️ forced MV2 uBlock Origin policy is set — open Chrome in the desktop to see it load"
-          if [ -d "/Applications/Google Chrome.app/Contents/Frameworks/mv2" ]; then
-            echo "🧪 runtime check: launching patched Chrome with MV2_MEMPATCH_DEBUG=1 ..."
-            CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          MV2_RUNTIME="⏭️ patch not applied — Chrome is stock (install.sh could not inject the dylib)"
+          MV2_EXT="⏭️ policy set — open Chrome in the desktop to see whether the MV2 extension loads"
+          if [ -x "$CHROME_BIN" ]; then
+            PATCH_ACTIVE=false
+            otool -l "$CHROME_BIN" 2>/dev/null | grep -q 'mv2-mem-patch.dylib' && PATCH_ACTIVE=true
+            echo "🧪 runtime check: launching Chrome with MV2_MEMPATCH_DEBUG=1 (patch active: $PATCH_ACTIVE) ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
               env MV2_MEMPATCH_DEBUG=1 "$CHROME_BIN" \
               --no-first-run --no-default-browser-check about:blank \
               > chrome-mv2.log 2>&1 &
             sleep 15
 
-            # Prefer Chrome's own stderr; fall back to the unified log.
-            MV2_LOG=$(grep -a '\[mv2patch\]' chrome-mv2.log 2>/dev/null || true)
-            if [ -z "$MV2_LOG" ]; then
-              MV2_LOG=$(sudo log show --last 3m --predicate 'eventMessage CONTAINS "[mv2patch]"' 2>/dev/null \
-                        | grep -a '\[mv2patch\]' || true)
-            fi
-            printf '%s\n' "$MV2_LOG"
-
-            if printf '%s' "$MV2_LOG" | grep -qi 'ENABLED\|patched in memory'; then
-              echo "✅ dylib loaded and flipped the MV2 gates in memory"
-              MV2_RUNTIME="✅ \`[mv2patch]\` reports gates patched in memory"
-            elif [ -n "$MV2_LOG" ]; then
-              echo "::warning::dylib loaded but reported no gate patched — check signatures.json coverage"
-              MV2_RUNTIME="⚠️ dylib loaded but reported no gate patched (see run log / \`signatures.json\`)"
-            else
-              echo "::warning::no [mv2patch] markers seen yet (Chrome may still be warming up) — verify in the desktop"
-              MV2_RUNTIME="⚠️ no \`[mv2patch]\` markers seen yet — verify manually in the desktop"
+            if [ "$PATCH_ACTIVE" = true ]; then
+              MV2_LOG=$(grep -a '\[mv2patch\]' chrome-mv2.log 2>/dev/null || true)
+              printf '%s\n' "$MV2_LOG"
+              if printf '%s' "$MV2_LOG" | grep -qi 'ENABLED\|patched in memory'; then
+                echo "✅ dylib loaded and flipped the MV2 gates in memory"
+                MV2_RUNTIME="✅ \`[mv2patch]\` reports gates patched in memory"
+              elif [ -n "$MV2_LOG" ]; then
+                echo "::warning::dylib loaded but reported no gate patched — check signatures.json coverage"
+                MV2_RUNTIME="⚠️ dylib loaded but reported no gate patched (see run log / \`signatures.json\`)"
+              else
+                echo "::warning::load command present but no [mv2patch] stderr yet — verify in the desktop"
+                MV2_RUNTIME="⚠️ dylib injected but no \`[mv2patch]\` output captured — verify in the desktop"
+              fi
             fi
 
-            # Did the forced MV2 extension actually land on disk? (needs network + a moment)
+            # Did the policy-forced MV2 extension land on disk? On stock Chrome an MV2
+            # extension is refused, so "not present" here is the expected control; with
+            # the patch it should install AND stay enabled. (Best-effort; needs network.)
             EXT_DIR="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Extensions/$UBO_ID"
             for i in {1..20}; do
               sudo test -d "$EXT_DIR" && break
@@ -338,8 +346,8 @@ jobs:
               echo "✅ MV2 uBlock Origin installed on disk"
               MV2_EXT="✅ MV2 uBlock Origin installed — open \`chrome://extensions\` and confirm it's **enabled** (not blocked)"
             else
-              echo "::warning::MV2 extension not on disk yet — verify in the desktop (chrome://extensions)"
-              MV2_EXT="⚠️ MV2 uBlock Origin not on disk yet — check \`chrome://extensions\` in the desktop"
+              echo "MV2 uBlock Origin not on disk (expected on stock Chrome — MV2 install is refused)"
+              MV2_EXT="⏳ MV2 uBlock Origin not installed — expected while unpatched; \`chrome://extensions\` / \`chrome://policy\` in the desktop show the state"
             fi
           fi
 
