@@ -46,12 +46,15 @@ _ZEROFILL_TYPES = {0x1, 0xC, 0x11}  # S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_
 # Load commands the main-exe stub does not need at runtime, safe to drop to reclaim
 # header padding for our LC_LOAD_DYLIB. Value = drop priority (lower drops first);
 # ordered least-useful → most, so we sacrifice the least metadata to make room.
+# NOTE: LC_UUID is NOT droppable — dyld (macOS 13+) refuses to load a main executable
+# with no LC_UUID ("missing LC_UUID load command" → abort). Only linkedit metadata
+# (source-version / function-starts / data-in-code) is safe to drop.
 LC_UUID = 0x1B
 LC_SOURCE_VERSION = 0x2A
 LC_FUNCTION_STARTS = 0x26
 LC_DATA_IN_CODE = 0x29
-_DROPPABLE = {LC_SOURCE_VERSION: 0, LC_UUID: 1, LC_FUNCTION_STARTS: 2, LC_DATA_IN_CODE: 3}
-_LC_NAME = {LC_UUID: "LC_UUID", LC_SOURCE_VERSION: "LC_SOURCE_VERSION",
+_DROPPABLE = {LC_SOURCE_VERSION: 0, LC_FUNCTION_STARTS: 1, LC_DATA_IN_CODE: 2}
+_LC_NAME = {LC_SOURCE_VERSION: "LC_SOURCE_VERSION",
             LC_FUNCTION_STARTS: "LC_FUNCTION_STARTS", LC_DATA_IN_CODE: "LC_DATA_IN_CODE"}
 
 
