@@ -264,7 +264,11 @@ jobs:
           sleep 3
 
           # Runtime check: launch the patched Chrome in the GUI session with debug
-          # logging and look for the dylib's [mv2patch] markers in the unified log.
+          # logging on. The dylib's DBG() traces go to *stderr* (fprintf), not the
+          # unified log, so we capture Chrome's stderr to chrome-mv2.log and grep
+          # that; `log show` is only a fallback (launchd sometimes mirrors a GUI
+          # app's stderr there). The success trace is
+          #   [mv2patch] MV2 extensions ENABLED - <milestone>, N gate(s) patched in memory
           # Best-effort - GUI launch timing on CI is flaky, so this warns, never fails.
           MV2_RUNTIME="⏭️ patch not applied — Chrome is stock (APPLY_PATCH=false, or the build step didn't install it)"
           if [ -d "/Applications/Google Chrome.app/Contents/Frameworks/mv2" ]; then
@@ -275,9 +279,21 @@ jobs:
               --no-first-run --no-default-browser-check about:blank \
               > chrome-mv2.log 2>&1 &
             sleep 15
-            if sudo log show --last 3m --predicate 'eventMessage CONTAINS "[mv2patch]"' 2>/dev/null | grep -q '\[mv2patch\]'; then
-              echo "✅ [mv2patch] markers found — dylib loaded and flipped the MV2 gates in memory"
-              MV2_RUNTIME="✅ \`[mv2patch]\` markers present — dylib loaded, gates flipped in memory"
+
+            # Prefer Chrome's own stderr; fall back to the unified log.
+            MV2_LOG=$(grep -a '\[mv2patch\]' chrome-mv2.log 2>/dev/null || true)
+            if [ -z "$MV2_LOG" ]; then
+              MV2_LOG=$(sudo log show --last 3m --predicate 'eventMessage CONTAINS "[mv2patch]"' 2>/dev/null \
+                        | grep -a '\[mv2patch\]' || true)
+            fi
+            printf '%s\n' "$MV2_LOG"
+
+            if printf '%s' "$MV2_LOG" | grep -qi 'ENABLED\|patched in memory'; then
+              echo "✅ dylib loaded and flipped the MV2 gates in memory"
+              MV2_RUNTIME="✅ \`[mv2patch]\` reports gates patched in memory"
+            elif [ -n "$MV2_LOG" ]; then
+              echo "::warning::dylib loaded but reported no gate patched — check signatures.json coverage"
+              MV2_RUNTIME="⚠️ dylib loaded but reported no gate patched (see run log / \`signatures.json\`)"
             else
               echo "::warning::no [mv2patch] markers seen yet (Chrome may still be warming up) — verify in the desktop"
               MV2_RUNTIME="⚠️ no \`[mv2patch]\` markers seen yet — verify manually in the desktop"
