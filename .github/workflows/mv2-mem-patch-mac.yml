@@ -21,6 +21,13 @@ on:
         description: 'Inject + re-sign Chrome (uncheck to only build & offline-inspect)'
         type: boolean
         default: true
+      INJECT_METHOD:
+        description: 'How to load the dylib'
+        type: choice
+        options:
+          - dyld
+          - loadcmd
+        default: dyld
       BREW_PACKAGES:
         description: 'Extra software to install (brew names, space or comma separated)'
         required: false
@@ -45,6 +52,7 @@ jobs:
       - name: Build & install MV2 mem-patch
         env:
           APPLY_PATCH: ${{ inputs.APPLY_PATCH }}
+          MV2_INJECT: ${{ inputs.INJECT_METHOD }}
           BREW_PACKAGES: ${{ inputs.BREW_PACKAGES }}
         run: |
           CHROME_APP="/Applications/Google Chrome.app"
@@ -136,17 +144,24 @@ jobs:
           # --- static verification -------------------------------------------
           EXE="$CHROME_APP/Contents/MacOS/Google Chrome"
           PY=$(command -v python3 || command -v python)
-          # New layout: the code dylib is installed beside the stub as MacOS/mv and
-          # loaded via @loader_path/mv (short path so it fits the reclaimed header
-          # room); signatures.json/config.txt stay in Resources/mv2/.
-          LOAD_PATH='@loader_path/mv'
           VERIFY_OK=true
 
-          if "$PY" ./macho_insert_dylib.py present "$LOAD_PATH" "$EXE"; then
-            echo "✅ load command injected into the main executable"
+          # How the dylib is wired in depends on the method:
+          #  - loadcmd: an LC_LOAD_DYLIB @loader_path/mv in the main exe
+          #  - dyld:    DYLD_INSERT_LIBRARIES in the bundle's Info.plist LSEnvironment
+          if [ "${MV2_INJECT:-dyld}" = loadcmd ]; then
+            if "$PY" ./macho_insert_dylib.py present '@loader_path/mv' "$EXE"; then
+              echo "✅ LC_LOAD_DYLIB @loader_path/mv present in main exe"
+            else
+              echo "::error::load command NOT present after install"; VERIFY_OK=false
+            fi
           else
-            echo "::error::load command NOT present after install"
-            VERIFY_OK=false
+            if /usr/libexec/PlistBuddy -c 'Print :LSEnvironment:DYLD_INSERT_LIBRARIES' \
+                 "$CHROME_APP/Contents/Info.plist" 2>/dev/null | grep -q '@executable_path/mv'; then
+              echo "✅ LSEnvironment DYLD_INSERT_LIBRARIES=@executable_path/mv set in Info.plist"
+            else
+              echo "::error::LSEnvironment DYLD_INSERT_LIBRARIES not set after install"; VERIFY_OK=false
+            fi
           fi
 
           if [ -f "$CHROME_APP/Contents/MacOS/mv" ]; then
@@ -163,7 +178,7 @@ jobs:
           fi
 
           if [ "$VERIFY_OK" = true ]; then
-            echo "- **Install:** ✅ dylib injected & bundle re-signed" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Install:** ✅ patched via \`${MV2_INJECT:-dyld}\` & bundle re-signed" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- **Install:** ❌ static verification failed (see logs)" >> "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -176,6 +191,7 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           MAC_PASSWORD: ${{ secrets.MAC_PASSWORD || inputs.MAC_PASSWORD }}
+          MV2_INJECT: ${{ inputs.INJECT_METHOD }}
         run: |
           if [ -z "$MAC_PASSWORD" ]; then
             echo "::error::Password is required. Set it in Settings > Secrets or in the workflow input."
@@ -283,84 +299,67 @@ jobs:
           CONSOLE_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
           [ -n "$CONSOLE_HOME" ] || CONSOLE_HOME="/Users/$CONSOLE_USER"
 
-          # Runtime check. Launch Chrome once in the GUI session with debug logging
-          # on (harmless if unpatched): this makes the dylib log if it is actually
-          # loaded, and lets the ExtensionSettings policy take effect so we can see
-          # whether the MV2 extension installs. Chrome stays up for you in the desktop.
-          #
-          # "Patched" is decided by the *real* load command in the executable (otool
-          # for @loader_path/mv), NOT by any leftover file — install.sh stages files
-          # before it injects, so a failed install can leave them behind.
-          #
-          # The dylib's DBG() traces go to *stderr* (fprintf), which we capture to
-          # chrome-mv2.log. We do NOT fall back to `log show`: a predicate containing
-          # "[mv2patch]" gets echoed into log show's own audit entry, so grepping its
-          # output self-matches and yields a false positive. Success trace:
-          #   [mv2patch] MV2 extensions ENABLED - <milestone>, N gate(s) patched in memory
-          # Best-effort - GUI launch timing on CI is flaky, so this warns, never fails.
-          CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-          MV2_RUNTIME="⏭️ patch not applied — Chrome is stock (install.sh could not inject the dylib)"
-          MV2_EXT="⏭️ policy set — open Chrome in the desktop to see whether the MV2 extension loads"
+          # Runtime check. Launch Chrome the NORMAL way (LaunchServices/`open`, in the
+          # GUI session) so the dyld method's Info.plist LSEnvironment takes effect. We
+          # detect success by whether our dylib (Contents/MacOS/mv) is actually mapped
+          # into the running Chrome process — method-agnostic, no debug stderr needed —
+          # plus whether the policy-forced MV2 uBlock lands on disk. Chrome stays up in
+          # the desktop, with the Widevine VMP lab opened for the DRM check.
+          CHROME_APP="/Applications/Google Chrome.app"
+          CHROME_BIN="$CHROME_APP/Contents/MacOS/Google Chrome"
+          MV2_RUNTIME="⏭️ patch not applied — Chrome is stock (install step did not patch)"
+          MV2_EXT="⏭️ open Chrome in the desktop to see whether the MV2 extension loads"
+          MV2_DRM="❓ open https://castlabs.github.io/wv-vmp-lab/ in the desktop — it must NOT show \`PLATFORM_TAMPERED\`"
           if [ -x "$CHROME_BIN" ]; then
-            PATCH_ACTIVE=false
-            otool -l "$CHROME_BIN" 2>/dev/null | grep -q '@loader_path/mv' && PATCH_ACTIVE=true
-            echo "🧪 runtime check: launching Chrome with MV2_MEMPATCH_DEBUG=1 (patch active: $PATCH_ACTIVE) ..."
-            # Redirect Chrome's stderr INSIDE the user context to a shared file —
-            # `launchctl asuser` does not reliably inherit our stdio, so a plain
-            # `> chrome-mv2.log` on our side can come back empty. Then copy it out.
-            CHROME_LOG=/tmp/chrome-mv2.log
-            sudo rm -f "$CHROME_LOG" 2>/dev/null || true
+            echo "🧪 runtime check: normal launch via LaunchServices (method=${MV2_INJECT:-dyld}) ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
-              bash -c "MV2_MEMPATCH_DEBUG=1 '$CHROME_BIN' --no-first-run --no-default-browser-check about:blank > '$CHROME_LOG' 2>&1" &
-            sleep 15
-            sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
-            sudo chmod 644 chrome-mv2.log 2>/dev/null || true
+              open -a "$CHROME_APP" --args --no-first-run --no-default-browser-check about:blank || true
+            sleep 20
 
-            echo "----- chrome-mv2.log (Chrome stderr, first 60 lines) -----"
-            sed -n '1,60p' chrome-mv2.log 2>/dev/null || true
-            [ -s chrome-mv2.log ] || echo "(chrome-mv2.log is EMPTY)"
             echo "----- Google Chrome processes -----"
-            pgrep -fl 'Google Chrome' 2>/dev/null | head -8 || echo "(no Chrome process running)"
-            echo "----- codesign -dvvv (main exe) -----"
-            codesign -dvvv "$CHROME_BIN" 2>&1 | grep -iE "Signature|Authority|flags=|CodeDirectory|Identifier|TeamIdent|Runtime|linker-signed" | head -20
-            echo "----- entitlements on main exe -----"
-            codesign -d --entitlements - --xml "$CHROME_BIN" 2>/dev/null | tr -d '\000' | grep -iE "disable-library|unsigned-exec|com\.apple\.security" | head -20
-            echo "----- AMFI / code-signing kill reason (last 2m) -----"
-            sudo log show --last 2m 2>/dev/null \
-              | grep -iE "google chrome|amfi|library validation|code signature|invalid signat|cs_invalid|killed:|taskgated|not valid" \
-              | grep -viE "screensharing|cloudflared|noVNC|novnc" | tail -30
-            echo "---------------------------------------------------------"
+            pgrep -fl 'Contents/MacOS/Google Chrome' 2>/dev/null | head -8 || echo "(no Chrome process running)"
 
-            if [ "$PATCH_ACTIVE" = true ]; then
-              MV2_LOG=$(grep -a '\[mv2patch\]' chrome-mv2.log 2>/dev/null || true)
-              printf '%s\n' "$MV2_LOG"
-              if printf '%s' "$MV2_LOG" | grep -qi 'ENABLED\|patched in memory'; then
-                echo "✅ dylib loaded and flipped the MV2 gates in memory"
-                MV2_RUNTIME="✅ \`[mv2patch]\` reports gates patched in memory"
-              elif [ -n "$MV2_LOG" ]; then
-                echo "::warning::dylib loaded but reported no gate patched — check signatures.json coverage"
-                MV2_RUNTIME="⚠️ dylib loaded but reported no gate patched (see run log / \`signatures.json\`)"
-              else
-                echo "::warning::load command present but no [mv2patch] stderr yet — verify in the desktop"
-                MV2_RUNTIME="⚠️ dylib injected but no \`[mv2patch]\` output captured — verify in the desktop"
-              fi
+            # Is our dylib mapped into any Chrome process (the browser)?
+            DYLIB_LOADED=false
+            for p in $(pgrep -f 'Contents/MacOS/Google Chrome' 2>/dev/null); do
+              if sudo lsof -p "$p" 2>/dev/null | grep -q '/Contents/MacOS/mv'; then DYLIB_LOADED=true; break; fi
+            done
+            if [ "$DYLIB_LOADED" = true ]; then
+              echo "✅ mv2 dylib is mapped into the Chrome browser process"
+              MV2_RUNTIME="✅ dylib loaded into Chrome (\`${MV2_INJECT:-dyld}\` injection)"
+            elif pgrep -f 'Contents/MacOS/Google Chrome' >/dev/null 2>&1; then
+              echo "::warning::Chrome is running but the mv2 dylib is not mapped — injection didn't take"
+              MV2_RUNTIME="⚠️ Chrome runs but dylib not injected — verify in the desktop"
+            else
+              echo "::warning::Chrome did not stay running (likely killed at launch) — see AMFI log below"
+              MV2_RUNTIME="⚠️ Chrome did not launch (killed?) — see run log"
+              echo "----- AMFI / code-signing kill reason (last 2m) -----"
+              sudo log show --last 2m 2>/dev/null \
+                | grep -iE "google chrome|amfi|library validation|code signature|invalid signat|not valid|killed:" \
+                | grep -viE "screensharing|cloudflared|novnc" | tail -25
             fi
 
             # Did the policy-forced MV2 extension land on disk? On stock Chrome an MV2
-            # extension is refused, so "not present" here is the expected control; with
-            # the patch it should install AND stay enabled. (Best-effort; needs network.)
+            # extension is refused, so "not present" is the control; patched => it
+            # installs and stays enabled. (Best-effort; needs network + a moment.)
             EXT_DIR="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Extensions/$UBO_ID"
-            for i in {1..20}; do
+            for i in {1..25}; do
               sudo test -d "$EXT_DIR" && break
               sleep 3
             done
             if sudo test -d "$EXT_DIR"; then
               echo "✅ MV2 uBlock Origin installed on disk"
-              MV2_EXT="✅ MV2 uBlock Origin installed — open \`chrome://extensions\` and confirm it's **enabled** (not blocked)"
+              MV2_EXT="✅ MV2 uBlock Origin installed — confirm **enabled** at \`chrome://extensions\`"
             else
-              echo "MV2 uBlock Origin not on disk (expected on stock Chrome — MV2 install is refused)"
-              MV2_EXT="⏳ MV2 uBlock Origin not installed — expected while unpatched; \`chrome://extensions\` / \`chrome://policy\` in the desktop show the state"
+              echo "MV2 uBlock Origin not on disk yet (expected on stock/unpatched Chrome)"
+              MV2_EXT="⚠️ MV2 uBlock not installed yet — check \`chrome://extensions\` in the desktop"
             fi
+
+            # DRM gate: open the castLabs Widevine VMP lab so it's ready to inspect.
+            # Widevine provisioning may need a moment on a fresh Chrome; verify in the
+            # desktop that it does NOT report PLATFORM_TAMPERED.
+            sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
+              open -a "$CHROME_APP" "https://castlabs.github.io/wv-vmp-lab/" 2>/dev/null || true
           fi
 
           perl -0pi -e 's/return clientTypes\.includes\(type\);/return type === securityTypeVNCAuth;/' /tmp/noVNC/core/rfb.js
@@ -498,6 +497,7 @@ jobs:
             echo "### macOS ${{ inputs.ARCH }} — MV2 testbed"
             echo "- 🧩 **MV2 mem-patch:** $MV2_RUNTIME"
             echo "- 🧪 **MV2 extension:** $MV2_EXT"
+            echo "- 🎬 **Widevine DRM:** $MV2_DRM"
             echo "- 👀 **To confirm:** open **Google Chrome** → \`chrome://extensions\`. The force-installed **uBlock Origin (MV2)** should be present and **enabled** — on unpatched Chrome it would be blocked with \"no longer supported\". (\`chrome://policy\` shows the applied ExtensionSettings policy.)"
             echo "- 🌐 [Open Desktop (browser)](${SESSION_URL})"
             echo "- 🔌 **Native VNC client:** run \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\` locally, then connect your VNC client to \`localhost:5900\`"

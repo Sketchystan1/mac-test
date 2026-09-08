@@ -32,6 +32,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # small code dylib goes in MacOS/; signatures.json/config.txt stay in Resources/mv2/.
 LOAD_PATH="@loader_path/mv"
 DYLIB_NAME="mv"
+# Injection method (env MV2_INJECT): 'loadcmd' injects an LC_LOAD_DYLIB into the main
+# exe (needs Mach-O header room); 'dyld' sets DYLD_INSERT_LIBRARIES via the bundle's
+# Info.plist LSEnvironment so a normal LaunchServices/Finder launch injects the dylib
+# with no header room needed. Both keep the framework stock on disk and re-sign the
+# main exe ad-hoc/non-hardened.
+METHOD="${MV2_INJECT:-loadcmd}"
 ENT_KEYS=(com.apple.security.cs.disable-library-validation \
           com.apple.security.cs.allow-unsigned-executable-memory)
 
@@ -131,7 +137,9 @@ do_install() {  # app
   local app="$1" exe bk py inj ent mv2dir
   exe="$(main_exe "$app")"; [ -e "$exe" ] || die "main executable not found: $exe"
   py="$(find_python)"       || die "python3 not found (install Xcode Command Line Tools: xcode-select --install)"
-  inj="$(find_injector)"    || die "macho_insert_dylib.py not found (keep the repo's scripts/ alongside, or copy it next to install.sh)"
+  if [ "$METHOD" = loadcmd ]; then
+    inj="$(find_injector)"    || die "macho_insert_dylib.py not found (keep the repo's scripts/ alongside, or copy it next to install.sh)"
+  fi
   [ -f "$SCRIPT_DIR/mv2-mem-patch.dylib" ] || die "mv2-mem-patch.dylib missing - run ./build.sh"
   [ -f "$SCRIPT_DIR/signatures.json" ]     || die "signatures.json missing - run ./build.sh"
 
@@ -145,7 +153,8 @@ do_install() {  # app
 
   # Establish a STOCK base for the executable (robust to re-install and to Chrome
   # auto-update, which drops in a fresh stock exe with no load command of ours).
-  if "$py" "$inj" present "$LOAD_PATH" "$exe"; then
+  # Only the loadcmd method modifies the exe; dyld leaves the bytes untouched.
+  if [ "$METHOD" = loadcmd ] && "$py" "$inj" present "$LOAD_PATH" "$exe"; then
     if [ -f "$bk/main.stock" ]; then
       cp "$bk/main.stock" "$exe" || die "could not restore stock executable from backup"
     else
@@ -168,8 +177,20 @@ do_install() {  # app
   local dylib="$app/Contents/MacOS/$DYLIB_NAME"
   cp "$SCRIPT_DIR/mv2-mem-patch.dylib" "$dylib" || die "could not copy dylib"
 
-  # Inject the load command into the main executable only.
-  "$py" "$inj" insert "$LOAD_PATH" "$exe" || die "load-command injection failed"
+  # Enable loading of our dylib.
+  if [ "$METHOD" = dyld ]; then
+    # No exe modification: set DYLD_INSERT_LIBRARIES on the bundle via LSEnvironment,
+    # so a normal LaunchServices/Finder launch injects the dylib. The non-hardened
+    # ad-hoc re-sign below lets dyld honor it. Sidesteps the main-exe header limit.
+    local plist="$app/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Delete :LSEnvironment:DYLD_INSERT_LIBRARIES" "$plist" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$plist" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Add :LSEnvironment:DYLD_INSERT_LIBRARIES string @executable_path/$DYLIB_NAME" "$plist" \
+      || die "could not set LSEnvironment DYLD_INSERT_LIBRARIES"
+  else
+    # Inject the load command into the main executable only.
+    "$py" "$inj" insert "$LOAD_PATH" "$exe" || die "load-command injection failed"
+  fi
 
   # Re-sign: dylib ad-hoc; main exe ad-hoc + merged entitlements, NON-hardened; then
   # re-seal the bundle (no --deep) so framework/helpers keep their stock signatures.
@@ -218,6 +239,8 @@ do_restore() {  # app
   fi
   rm -rf "$app/Contents/Resources/mv2"
   rm -f "$app/Contents/MacOS/$DYLIB_NAME"
+  # Remove the dyld-method LSEnvironment injection if present (harmless otherwise).
+  /usr/libexec/PlistBuddy -c "Delete :LSEnvironment:DYLD_INSERT_LIBRARIES" "$app/Contents/Info.plist" 2>/dev/null || true
 
   # Re-seal ad-hoc, keeping disable-library-validation so the (now ad-hoc) main exe
   # can still load the stock Google-signed framework at launch.
