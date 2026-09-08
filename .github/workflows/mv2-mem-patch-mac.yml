@@ -28,6 +28,10 @@ on:
           - dyld
           - loadcmd
         default: dyld
+      SMOKE_TEST:
+        description: 'Run checks then exit (skip the 6h VNC desktop)'
+        type: boolean
+        default: false
       BREW_PACKAGES:
         description: 'Extra software to install (brew names, space or comma separated)'
         required: false
@@ -192,6 +196,7 @@ jobs:
         env:
           MAC_PASSWORD: ${{ secrets.MAC_PASSWORD || inputs.MAC_PASSWORD }}
           MV2_INJECT: ${{ inputs.INJECT_METHOD }}
+          SMOKE_TEST: ${{ inputs.SMOKE_TEST }}
         run: |
           if [ -z "$MAC_PASSWORD" ]; then
             echo "::error::Password is required. Set it in Settings > Secrets or in the workflow input."
@@ -360,6 +365,16 @@ jobs:
             # desktop that it does NOT report PLATFORM_TAMPERED.
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
               open -a "$CHROME_APP" "https://castlabs.github.io/wv-vmp-lab/" 2>/dev/null || true
+          fi
+
+          # Smoke mode: report and stop before the (6h) VNC desktop so the run
+          # self-completes and the full log is readable without cancel-timing games.
+          if [ "${SMOKE_TEST:-false}" = "true" ]; then
+            echo "🔬 SMOKE_TEST complete (method=${MV2_INJECT:-dyld}) — skipping VNC desktop + keepalive."
+            echo "RESULT | runtime: $MV2_RUNTIME"
+            echo "RESULT | extension: $MV2_EXT"
+            echo "RESULT | drm: (needs the desktop / Widevine provisioning — not auto-checked)"
+            exit 0
           fi
 
           perl -0pi -e 's/return clientTypes\.includes\(type\);/return type === securityTypeVNCAuth;/' /tmp/noVNC/core/rfb.js
