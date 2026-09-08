@@ -344,7 +344,7 @@ jobs:
             sudo -u "$CONSOLE_USER" rm -f "$CONSOLE_HOME/Library/Logs/DiagnosticReports/"*.ips 2>/dev/null || true
             echo "🧪 runtime check: launching Chrome ($ENVV) + uBlock MV2 → loading a real page ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
-              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check $EXT_FLAGS https://example.com > '$CHROME_LOG' 2>&1" &
+              bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check --remote-debugging-port=9222 --enable-logging=stderr $EXT_FLAGS https://example.com > '$CHROME_LOG' 2>&1" &
             sleep 20
             sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
             sudo chmod 644 chrome-mv2.log 2>/dev/null || true
@@ -390,29 +390,26 @@ jobs:
                 | grep -viE "screensharing|cloudflared|novnc" | tail -25
             fi
 
-            # Did the MV2 extension actually load? --load-extension doesn't populate
-            # Default/Extensions, so look for uBlock in the profile (it records the
-            # loaded extension) and for an MV2-refusal in Chrome's logs. On stock Chrome
-            # MV2 is refused ("Manifest version 2 is no longer supported"); patched => it
-            # loads and stays enabled.
-            PREFS="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Preferences"
-            SECURE_PREFS="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Secure Preferences"
-            UBO_LOADED=false
-            for i in {1..20}; do
-              if sudo grep -qi 'ublock\|ublock origin\|cjpalhdlnbp\|"manifest_version":2' "$PREFS" "$SECURE_PREFS" 2>/dev/null; then UBO_LOADED=true; break; fi
-              sleep 3
-            done
-            MV2_REFUSED=$(sudo log show --last 2m --predicate 'process == "Google Chrome"' 2>/dev/null \
-                          | grep -iE 'manifest version 2|no longer supported|MV2' | head -3 || true)
-            if [ "$UBO_LOADED" = true ]; then
-              echo "✅ uBlock present in the profile — MV2 extension loaded"
-              MV2_EXT="✅ uBlock (MV2) loaded via --load-extension — confirm **enabled** at \`chrome://extensions\`"
-            elif [ -n "$MV2_REFUSED" ]; then
-              echo "::warning::Chrome refused the MV2 extension:"; printf '%s\n' "$MV2_REFUSED"
-              MV2_EXT="❌ Chrome refused the MV2 extension (\"no longer supported\") — patch didn't cover the load path"
+            # Did the MV2 extension actually load? Ask Chrome directly via the DevTools
+            # Protocol (lists every target, incl. extension background pages) — definitive,
+            # unlike grepping Preferences (which false-matches Chrome's built-in MV2
+            # component extensions). A uBlock background page shows as a chrome-extension://
+            # target when it loads.
+            echo "----- CDP targets (curl 127.0.0.1:9222/json) -----"
+            CDP=$(curl -s --max-time 10 http://127.0.0.1:9222/json 2>/dev/null || true)
+            printf '%s' "$CDP" | grep -oE '"(type|title|url)": *"[^"]*"' | head -40 || echo "(no CDP response)"
+            echo "----- extension-related stderr / MV2 refusal -----"
+            grep -aiE 'manifest version 2|no longer supported|load.?extension|extension.*(error|fail|invalid|disabled)|ublock|/tmp/ubo' chrome-mv2.log 2>/dev/null | head -20 || true
+
+            if printf '%s' "$CDP" | grep -qi 'chrome-extension://\|uBlock'; then
+              echo "✅ an extension background page is live in Chrome (see CDP targets)"
+              MV2_EXT="✅ uBlock (MV2) loaded — confirm **enabled** at \`chrome://extensions\`"
+            elif grep -aiqE 'manifest version 2|no longer supported' chrome-mv2.log 2>/dev/null; then
+              echo "::warning::Chrome refused the MV2 extension"
+              MV2_EXT="❌ Chrome refused the MV2 extension (\"no longer supported\") — the load path isn't covered by the patch"
             else
-              echo "uBlock not confirmed in the profile yet — verify in the desktop"
-              MV2_EXT="⏳ uBlock (MV2) launched via --load-extension — confirm at \`chrome://extensions\` in the desktop"
+              echo "::warning::no extension target found — uBlock did not load (see CDP + stderr above)"
+              MV2_EXT="❌ uBlock (MV2) did not load — see run log (CDP targets / stderr)"
             fi
 
             # DRM gate: open the castLabs Widevine VMP lab so it's ready to inspect.
