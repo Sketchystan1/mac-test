@@ -1,0 +1,403 @@
+name: macOS MV2 mem-patch testbed
+
+# Builds + installs Sketchystan1/chrome-mv2-patch's macOS in-process MV2 mem-patch
+# on a fresh Google Chrome, verifies it, then hands you a VNC desktop (same rig as
+# mac.yml) so you can load a real Manifest V2 extension and confirm it works live.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ARCH:
+        description: 'Architecture'
+        type: choice
+        options:
+          - arm64
+          - x64
+        default: arm64
+      MAC_PASSWORD:
+        description: 'VNC password (required if not set in Secrets, max 8 chars)'
+        required: false
+      PATCH_REPO:
+        description: 'Patch repo (owner/name)'
+        required: false
+        default: 'Sketchystan1/chrome-mv2-patch'
+      PATCH_REF:
+        description: 'Branch, tag or commit of the patch repo to test'
+        required: false
+        default: 'master'
+      APPLY_PATCH:
+        description: 'Inject + re-sign Chrome (uncheck to only build & offline-inspect)'
+        type: boolean
+        default: true
+      BREW_PACKAGES:
+        description: 'Extra software to install (brew names, space or comma separated)'
+        required: false
+        default: ''
+
+jobs:
+  testbed:
+    # macos-13 is the last Intel runner image GitHub offers; it is being phased
+    # out. When it is retired, x64 will fail to queue. The patch dylib is built
+    # universal (arm64 + x86_64) either way.
+    runs-on: ${{ inputs.ARCH == 'x64' && 'macos-13' || 'macos-latest' }}
+    timeout-minutes: 360
+    # A new dispatch of the same arch cancels the previous run so old sessions
+    # don't silently burn the full 6h timeout in the background.
+    concurrency:
+      group: ${{ github.workflow }}-${{ inputs.ARCH }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Build & install MV2 mem-patch
+        env:
+          PATCH_REPO: ${{ inputs.PATCH_REPO }}
+          PATCH_REF: ${{ inputs.PATCH_REF }}
+          APPLY_PATCH: ${{ inputs.APPLY_PATCH }}
+          BREW_PACKAGES: ${{ inputs.BREW_PACKAGES }}
+        run: |
+          CHROME_APP="/Applications/Google Chrome.app"
+
+          # --- Google Chrome + any extra requested packages -------------------
+          echo "📦 installing Google Chrome ..."
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask google-chrome \
+            || echo "::warning::google-chrome cask install reported an issue"
+
+          # Optional software requested at dispatch time. Casks are GUI apps,
+          # formulae are CLI tools.
+          if [ -n "$BREW_PACKAGES" ]; then
+            for PKG in $(printf '%s' "$BREW_PACKAGES" | tr ',' ' '); do
+              echo "📦 brew install $PKG"
+              if brew info --cask "$PKG" > /dev/null 2>&1; then
+                HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask "$PKG" \
+                  || echo "::warning::Failed to install cask: $PKG"
+              else
+                HOMEBREW_NO_AUTO_UPDATE=1 brew install "$PKG" \
+                  || echo "::warning::Failed to install formula: $PKG"
+              fi
+            done
+          fi
+
+          if [ ! -d "$CHROME_APP" ]; then
+            echo "::error::Google Chrome not found at $CHROME_APP"
+            exit 1
+          fi
+          CHROME_VER=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' \
+            "$CHROME_APP/Contents/Info.plist" 2>/dev/null || echo unknown)
+
+          # --- fetch the patch repo at the requested ref ----------------------
+          echo "⬇️  cloning $PATCH_REPO @ $PATCH_REF ..."
+          git clone "https://github.com/$PATCH_REPO" /tmp/mv2patch
+          git -C /tmp/mv2patch checkout "$PATCH_REF" \
+            || echo "::warning::could not checkout '$PATCH_REF'; staying on the default branch"
+          PATCH_SHA=$(git -C /tmp/mv2patch rev-parse --short HEAD)
+          cd /tmp/mv2patch/mv2-mem-patch-mac
+          chmod +x build.sh install.sh
+
+          # --- build (universal dylib + offline inspector) --------------------
+          echo "🔨 ./build.sh ..."
+          if ! ./build.sh; then
+            echo "::error::build.sh failed"
+            exit 1
+          fi
+          if [ ! -f mv2-mem-patch.dylib ] || [ ! -x mv2-inspect ]; then
+            echo "::error::build did not produce mv2-mem-patch.dylib and mv2-inspect"
+            exit 1
+          fi
+
+          # --- offline inspect (read-only: is this Chrome build covered?) -----
+          echo "🔍 ./install.sh --offline ..."
+          OFFLINE_OUT=$(./install.sh --offline "$CHROME_APP" 2>&1)
+          OFFLINE_RC=$?
+          printf '%s\n' "$OFFLINE_OUT"
+
+          {
+            echo "## 🧩 MV2 mem-patch — \`$PATCH_REPO@$PATCH_SHA\`"
+            echo "- **Chrome:** \`$CHROME_VER\` (${{ inputs.ARCH }})"
+            echo "- **Build:** ✅ universal dylib + inspector built"
+            if [ $OFFLINE_RC -eq 0 ]; then
+              echo "- **Offline inspect:** ✅ this Chrome build is covered by \`signatures.json\`"
+            else
+              echo "- **Offline inspect:** ❌ this Chrome build is NOT covered (rc=$OFFLINE_RC)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ $OFFLINE_RC -ne 0 ]; then
+            echo "::error::Offline inspect failed — this Chrome version isn't in signatures.json. Not installing."
+            {
+              echo "<details><summary>mv2-inspect output</summary>"
+              printf '\n```\n%s\n```\n</details>\n' "$OFFLINE_OUT"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "$APPLY_PATCH" != "true" ]; then
+            echo "APPLY_PATCH=false → built & inspected only; Chrome left stock."
+            echo "- **Install:** ⏭️ skipped (APPLY_PATCH=false) — desktop runs stock Chrome" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # --- install (inject LC_LOAD_DYLIB + ad-hoc re-sign) ----------------
+          echo "🛠  ./install.sh ..."
+          if ! ./install.sh "$CHROME_APP"; then
+            echo "::error::install.sh failed (writability/TCC? see output above)"
+            echo "- **Install:** ❌ install.sh failed (see logs)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # --- static verification -------------------------------------------
+          EXE="$CHROME_APP/Contents/MacOS/Google Chrome"
+          PY=$(command -v python3 || command -v python)
+          LOAD_PATH='@executable_path/../Frameworks/mv2/mv2-mem-patch.dylib'
+          VERIFY_OK=true
+
+          if "$PY" ../scripts/macho_insert_dylib.py present "$LOAD_PATH" "$EXE"; then
+            echo "✅ load command injected into the main executable"
+          else
+            echo "::error::load command NOT present after install"
+            VERIFY_OK=false
+          fi
+
+          if [ -f "$CHROME_APP/Contents/Frameworks/mv2/mv2-mem-patch.dylib" ]; then
+            echo "✅ dylib placed inside the bundle"
+          else
+            echo "::error::dylib missing from the bundle"
+            VERIFY_OK=false
+          fi
+
+          if codesign --verify "$CHROME_APP" 2>/dev/null; then
+            echo "✅ codesign --verify passed"
+          else
+            echo "::warning::codesign --verify reported issues (often benign for ad-hoc/mixed-signer bundles)"
+          fi
+
+          if [ "$VERIFY_OK" = true ]; then
+            echo "- **Install:** ✅ dylib injected & bundle re-signed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Install:** ❌ static verification failed (see logs)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Start VNC desktop
+        # Runs even if the patch step failed (e.g. this Chrome isn't in
+        # signatures.json yet) so you still get a desktop to investigate. The job
+        # is still marked failed by the patch step, preserving the test signal.
+        if: ${{ !cancelled() }}
+        env:
+          MAC_PASSWORD: ${{ secrets.MAC_PASSWORD || inputs.MAC_PASSWORD }}
+        run: |
+          if [ -z "$MAC_PASSWORD" ]; then
+            echo "::error::Password is required. Set it in Settings > Secrets or in the workflow input."
+            exit 1
+          fi
+
+          echo "::add-mask::$MAC_PASSWORD"
+
+          if [ ${#MAC_PASSWORD} -gt 8 ]; then
+            echo "::warning::Only the first 8 characters of the password are used."
+          fi
+
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install cloudflared
+
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
+
+          CONSOLE_USER=$(stat -f %Su /dev/console 2>/dev/null || true)
+          if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+            echo "::error::No active GUI console session found. Cannot provide a desktop."
+            exit 1
+          fi
+          GUI_UID=$(id -u "$CONSOLE_USER")
+
+          if [ "$CONSOLE_USER" != "admin" ]; then
+            sudo dscl . -change "/Users/$CONSOLE_USER" RecordName "$CONSOLE_USER" admin 2>/dev/null || true
+            CONSOLE_USER=admin
+          fi
+          export USER="$CONSOLE_USER" LOGNAME="$CONSOLE_USER"
+
+          sudo sysadminctl -resetPasswordFor "$CONSOLE_USER" -newPassword "$MAC_PASSWORD" 2>/dev/null \
+            || sudo dscl . -passwd "/Users/$CONSOLE_USER" "$MAC_PASSWORD" 2>/dev/null || true
+          sudo dseditgroup -o edit -a "$CONSOLE_USER" -t user admin 2>/dev/null || true
+
+          sudo systemsetup -setsleep Never 2>/dev/null || true
+          sudo systemsetup -setdisplaysleep Never 2>/dev/null || true
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 powernap 0 2>/dev/null || true
+          caffeinate -dimsu > caffeinate.log 2>&1 &
+
+          # No screensaver - otherwise the session locks behind us mid-run.
+          # sudo -H so `defaults` gets the target user's HOME for the ByHost plist.
+          sudo -H -u "$CONSOLE_USER" defaults -currentHost write com.apple.screensaver idleTime 0 2>/dev/null || true
+          sudo defaults write com.apple.universalaccess reduceTransparency -bool true
+          sudo defaults write com.apple.universalaccess reduceMotion -bool true
+
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCLegacyConnectionsAllowed -bool true
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCAlwaysStartOnConsole -bool true
+
+          TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+          if [ -f "$TCC_DB" ]; then
+            for SERVICE in kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServicePostEvent; do
+              sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified) VALUES ('$SERVICE', 'com.apple.screensharing.agent', 0, 2, 4, 1, NULL, NULL, 0, 'UNUSED', NULL, 0, strftime('%s','now'));" 2>/dev/null || true
+              sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified) VALUES ('$SERVICE', 'com.apple.RemoteManagement', 0, 2, 4, 1, NULL, NULL, 0, 'UNUSED', NULL, 0, strftime('%s','now'));" 2>/dev/null || true
+            done
+            sudo killall tccd 2>/dev/null || true
+          fi
+
+          KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          sudo "$KICKSTART" -deactivate -stop 2>/dev/null || true
+          sleep 2
+          sudo "$KICKSTART" \
+            -activate -configure -access -on -restart -agent -privs -all -allowAccessFor -allUsers \
+            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$MAC_PASSWORD"
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+
+          PORT_OK=false
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5900 2>/dev/null; then
+              PORT_OK=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$PORT_OK" != "true" ]; then
+            echo "::error::Server (port 5900) did not start."
+            exit 1
+          fi
+
+          sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" open -a Finder 2>/dev/null || true
+          sleep 3
+
+          # Runtime check: launch the patched Chrome in the GUI session with debug
+          # logging and look for the dylib's [mv2patch] markers in the unified log.
+          # Best-effort - GUI launch timing on CI is flaky, so this warns, never fails.
+          MV2_RUNTIME="⏭️ patch not applied — Chrome is stock (APPLY_PATCH=false, or the build step didn't install it)"
+          if [ -d "/Applications/Google Chrome.app/Contents/Frameworks/mv2" ]; then
+            echo "🧪 runtime check: launching patched Chrome with MV2_MEMPATCH_DEBUG=1 ..."
+            CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
+              env MV2_MEMPATCH_DEBUG=1 "$CHROME_BIN" \
+              --no-first-run --no-default-browser-check about:blank \
+              > chrome-mv2.log 2>&1 &
+            sleep 15
+            if sudo log show --last 3m --predicate 'eventMessage CONTAINS "[mv2patch]"' 2>/dev/null | grep -q '\[mv2patch\]'; then
+              echo "✅ [mv2patch] markers found — dylib loaded and flipped the MV2 gates in memory"
+              MV2_RUNTIME="✅ \`[mv2patch]\` markers present — dylib loaded, gates flipped in memory"
+            else
+              echo "::warning::no [mv2patch] markers seen yet (Chrome may still be warming up) — verify in the desktop"
+              MV2_RUNTIME="⚠️ no \`[mv2patch]\` markers seen yet — verify manually in the desktop"
+            fi
+          fi
+
+          perl -0pi -e 's/return clientTypes\.includes\(type\);/return type === securityTypeVNCAuth;/' /tmp/noVNC/core/rfb.js
+          if ! grep -q "return type === securityTypeVNCAuth" /tmp/noVNC/core/rfb.js; then
+            echo "::warning::Client patch failed."
+          fi
+          /tmp/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > novnc.log 2>&1 &
+          sleep 3
+
+          # Two tunnels: HTTPS for browser access (noVNC), TCP for native VNC clients
+          cloudflared tunnel --url http://localhost:6080 --no-autoupdate > cloudflared.log 2>&1 &
+          cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate > cloudflared-tcp.log 2>&1 &
+
+          wait_for_tunnel_url() {
+            local LOGFILE="$1" URL
+            for i in {1..30}; do
+              URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' "$LOGFILE" | tail -n 1) || true
+              if [ -n "$URL" ]; then
+                printf '%s\n' "$URL"
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
+          TUNNEL_URL=$(wait_for_tunnel_url cloudflared.log) || true
+          TCP_TUNNEL_URL=$(wait_for_tunnel_url cloudflared-tcp.log) || true
+
+          if [ -z "$TUNNEL_URL" ] || [ -z "$TCP_TUNNEL_URL" ]; then
+            echo "::error::Failed to start Cloudflare tunnel(s)!"
+            cat cloudflared.log cloudflared-tcp.log
+            exit 1
+          fi
+
+          SESSION_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&resize=remote"
+
+          echo "🌐 Browser: $SESSION_URL"
+          echo "🔌 Native VNC: run 'cloudflared access tcp --hostname $TCP_TUNNEL_URL --url localhost:5900' locally, then connect your VNC client to localhost:5900"
+
+          {
+            echo "### macOS ${{ inputs.ARCH }} — MV2 testbed"
+            echo "- 🧩 **MV2 mem-patch:** $MV2_RUNTIME"
+            echo "- 🧪 **To test:** open **Google Chrome** → \`chrome://extensions\` → enable *Developer mode* → *Load unpacked* a **Manifest V2** extension. It should load instead of showing the \"no longer supported\" block."
+            echo "- 🌐 [Open Desktop (browser)](${SESSION_URL})"
+            echo "- 🔌 **Native VNC client:** run \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\` locally, then connect your VNC client to \`localhost:5900\`"
+            echo "- 👤 **Username:** \`$CONSOLE_USER\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          end=$((SECONDS + 21600))
+          TUNNEL_FAILURES=0
+          while [ $SECONDS -lt $end ]; do
+            if ! nc -z 127.0.0.1 5900 2>/dev/null; then
+              echo "⚠️ 5900 down - restarting screensharing..."
+              sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+              sleep 4
+            fi
+            if ! nc -z 127.0.0.1 6080 2>/dev/null; then
+              echo "⚠️ 6080 down - restarting noVNC..."
+              pkill -f novnc_proxy 2>/dev/null || true
+              /tmp/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 >> novnc.log 2>&1 &
+            fi
+
+            # Browser tunnel: probe it end-to-end; restart cloudflared after 2 consecutive failures
+            if curl -sf -m 15 "${TUNNEL_URL}/vnc.html" > /dev/null 2>&1; then
+              TUNNEL_FAILURES=0
+            else
+              TUNNEL_FAILURES=$((TUNNEL_FAILURES + 1))
+              echo "⚠️ browser tunnel unreachable ($TUNNEL_FAILURES/2)"
+              if [ "$TUNNEL_FAILURES" -ge 2 ]; then
+                echo "⚠️ restarting HTTP tunnel..."
+                pkill -f "cloudflared tunnel --url http://localhost:6080" 2>/dev/null || true
+                sleep 2
+                cloudflared tunnel --url http://localhost:6080 --no-autoupdate >> cloudflared.log 2>&1 &
+                TUNNEL_URL=$(wait_for_tunnel_url cloudflared.log) || true
+                if [ -n "$TUNNEL_URL" ]; then
+                  SESSION_URL="${TUNNEL_URL}/vnc.html?autoconnect=true&resize=remote"
+                  echo "🌐 New browser URL: $SESSION_URL"
+                  echo "- 🌐 [Open Desktop (browser) - tunnel restarted](${SESSION_URL})" >> "$GITHUB_STEP_SUMMARY"
+                else
+                  echo "::warning::HTTP tunnel restart did not produce a URL."
+                fi
+                TUNNEL_FAILURES=0
+              fi
+            fi
+
+            # Native client tunnel: just needs a live process
+            if ! pgrep -f "cloudflared tunnel --url tcp://localhost:5900" > /dev/null 2>&1; then
+              echo "⚠️ TCP tunnel down - restarting..."
+              cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate >> cloudflared-tcp.log 2>&1 &
+              TCP_TUNNEL_URL=$(wait_for_tunnel_url cloudflared-tcp.log) || true
+              if [ -n "$TCP_TUNNEL_URL" ]; then
+                echo "🔌 New native VNC host: $TCP_TUNNEL_URL"
+                echo "- 🔌 **Native VNC (tunnel restarted):** \`cloudflared access tcp --hostname ${TCP_TUNNEL_URL} --url localhost:5900\`" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+
+            echo "✓ alive - $(date '+%H:%M:%S')"
+            sleep 300
+          done
+
+      - name: Upload logs
+        # Only a genuine failure keeps logs; closing the session (cancel) or a
+        # normal end leaves nothing behind.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ inputs.ARCH }}
+          path: |
+            cloudflared.log
+            cloudflared-tcp.log
+            novnc.log
+            caffeinate.log
+            chrome-mv2.log
+          if-no-files-found: ignore
+
+      - name: Remove logs
+        if: always()
+        run: rm -f cloudflared.log cloudflared-tcp.log novnc.log caffeinate.log chrome-mv2.log
