@@ -268,22 +268,22 @@ jobs:
           # its off-store update_url via Chrome's ExtensionSettings policy, so the
           # session boots with an MV2 extension already requested. On stock Chrome
           # MV2 is disabled ("no longer supported"); with the mem-patch it should
-          # stay ENABLED — that enabled state is the real end-to-end test. Written
-          # to the console user's own domain (that's the uid Chrome runs as here);
-          # set before any Chrome launch so it is picked up on startup, and it also
-          # persists for when you open Chrome by hand in the desktop.
+          # stay ENABLED — that enabled state is the real end-to-end test.
           UBO_ID=fkgkibajhfbepljeaefdnfnegdcjomkh
-          # Run `defaults` INSIDE the user's GUI/bootstrap session (same way Chrome
-          # is launched below). A plain `sudo -u "$USER" defaults write` is refused
-          # by cfprefsd here with "Could not write domain com.google.Chrome; exiting".
-          # Non-fatal: the step runs under `bash -e`, and the policy is a convenience
-          # (it also persists for when you open Chrome by hand in the desktop).
-          if sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
-               defaults write com.google.Chrome ExtensionSettings \
+          # Deliver it through macOS *Managed Preferences* (the enterprise-policy
+          # channel), not the user domain: a per-user `defaults write com.google.Chrome`
+          # is refused by cfprefsd here ("Could not write domain"), even via
+          # `launchctl asuser`. A managed policy also lands as MANDATORY, which is what
+          # force-install requires. Write as root before any Chrome launch and flush
+          # cfprefsd so the next launch reads it. Non-fatal (step runs under `bash -e`).
+          MANAGED="/Library/Managed Preferences"
+          sudo mkdir -p "$MANAGED" 2>/dev/null || true
+          if sudo defaults write "$MANAGED/com.google.Chrome" ExtensionSettings \
                '{"fkgkibajhfbepljeaefdnfnegdcjomkh" = {"installation_mode" = "normal_installed"; "update_url" = "https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml";};}' 2>/dev/null; then
-            echo "🧩 policy: forced MV2 uBlock Origin ($UBO_ID) via ExtensionSettings"
+            sudo killall cfprefsd 2>/dev/null || true
+            echo "🧩 policy: forced MV2 uBlock Origin ($UBO_ID) via Managed Preferences"
           else
-            echo "::warning::could not set ExtensionSettings policy (defaults write refused)"
+            echo "::warning::could not set ExtensionSettings managed policy"
           fi
 
           # Resolve the console user's real home (RecordName may be aliased to admin
