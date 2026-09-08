@@ -370,6 +370,33 @@ jobs:
             sudo killall cfprefsd 2>/dev/null || true; sleep 1
             echo "🧩 wrote forced Chrome policy → Managed Preferences (ExtensionSettings + ForceList); read-back:"
             sudo defaults read "$MP/com.google.Chrome" 2>/dev/null | sed 's/^/    /' || echo "    (read-back failed)"
+            # Ground truth: does Chrome's own policy API treat these as FORCED? Chrome on
+            # macOS reads platform policy via exactly CFPreferencesAppValueIsForced /
+            # CopyAppValue, so this settles whether a hand-dropped Managed Preferences file
+            # counts as mandatory policy (forced=YES) or is ignored (forced=no).
+            CSRC='#include <CoreFoundation/CoreFoundation.h>
+            #include <stdio.h>
+            int main(void){
+              CFStringRef app = CFSTR("com.google.Chrome");
+              const char* keys[] = {"ExtensionInstallForcelist","ExtensionSettings","ExtensionManifestV2Availability"};
+              for (int i = 0; i < 3; i++) {
+                CFStringRef k = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+                Boolean forced = CFPreferencesAppValueIsForced(k, app);
+                CFPropertyListRef v = CFPreferencesCopyAppValue(k, app);
+                printf("  %s: forced=%s present=%s\n", keys[i], forced ? "YES" : "no", v ? "YES" : "no");
+                if (v) CFRelease(v);
+                CFRelease(k);
+              }
+              return 0;
+            }'
+            printf '%s\n' "$CSRC" > /tmp/isforced.c
+            if clang -framework CoreFoundation -o /tmp/isforced /tmp/isforced.c 2>/tmp/cc.err; then
+              echo "🔎 CFPreferences view of com.google.Chrome policy (ground truth for 'is it forced'):"
+              echo "   [root]"; sudo /tmp/isforced || true
+              echo "   [$CONSOLE_USER]"; sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" /tmp/isforced || true
+            else
+              echo "::warning::isforced probe compile failed: $(head -1 /tmp/cc.err 2>/dev/null)"
+            fi
           else
             echo "::warning::could not write $MP/com.google.Chrome.plist"
           fi
@@ -488,7 +515,7 @@ jobs:
             # in Default/Extensions/<id> once Chrome fetches the CRX from update_url. If
             # the managed-prefs read didn't take, the staged Desktop copies are the fallback.
             EXT_DIR="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Extensions/$UBO_ID"
-            for i in {1..30}; do sudo test -d "$EXT_DIR" && break; sleep 3; done
+            for i in {1..60}; do sudo test -d "$EXT_DIR" && break; sleep 3; done
             if sudo test -d "$EXT_DIR"; then
               echo "✅ uBlock force-installed by the Managed Preferences policy ($EXT_DIR)"
               MV2_EXT="✅ uBlock (MV2) **force-installed by policy** (Managed Preferences) — persistent. Confirm at \`chrome://extensions\` / \`chrome://policy\`."
