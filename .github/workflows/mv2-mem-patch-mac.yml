@@ -316,6 +316,12 @@ jobs:
           MV2_EXT="⏭️ open Chrome in the desktop to see whether the MV2 extension loads"
           MV2_DRM="❓ open https://castlabs.github.io/wv-vmp-lab/ in the desktop — it must NOT show \`PLATFORM_TAMPERED\`"
           if [ -x "$CHROME_BIN" ]; then
+            # The ad-hoc re-signed Chrome is an "unidentified developer"; launching it
+            # via LaunchServices (`open`) pops a Gatekeeper dialog that blocks forever
+            # on a headless runner. Disable Gatekeeper assessment + clear the quarantine
+            # xattr so `open` launches it non-interactively.
+            sudo spctl --master-disable 2>/dev/null || true
+            sudo xattr -dr com.apple.quarantine "$CHROME_APP" 2>/dev/null || true
             echo "🧪 runtime check: normal launch via LaunchServices (method=${MV2_INJECT:-dyld}) ..."
             sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
               open -a "$CHROME_APP" --args --no-first-run --no-default-browser-check about:blank || true
