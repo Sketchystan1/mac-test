@@ -423,7 +423,7 @@ jobs:
           if ! grep -q "return type === securityTypeVNCAuth" /tmp/noVNC/core/rfb.js; then
             echo "::warning::Client patch failed."
           fi
-          /tmp/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 > novnc.log 2>&1 &
+          /tmp/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 127.0.0.1:6080 > novnc.log 2>&1 &
           sleep 3
 
           # Two tunnels: HTTPS for browser access (noVNC), TCP for native VNC clients
@@ -573,7 +573,7 @@ jobs:
             if ! nc -z 127.0.0.1 6080 2>/dev/null; then
               echo "⚠️ 6080 down - restarting noVNC..."
               pkill -f novnc_proxy 2>/dev/null || true
-              /tmp/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 >> novnc.log 2>&1 &
+              /tmp/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 127.0.0.1:6080 >> novnc.log 2>&1 &
             fi
 
             # Browser tunnel: probe it end-to-end; restart cloudflared after 2 consecutive failures
