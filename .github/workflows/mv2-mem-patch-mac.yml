@@ -291,12 +291,15 @@ jobs:
           UBO_SRC=""
           UBO_DIR=/tmp/ubo
           rm -rf "$UBO_DIR"; mkdir -p "$UBO_DIR"
-          # Get the version from gorhill's update manifest (raw.githubusercontent — no
-          # api.github.com rate limit) and build the .chromium.zip release URL from it.
-          UBO_VER=$(curl -fsSL https://raw.githubusercontent.com/gorhill/uBlock/master/dist/chromium/update.xml 2>/dev/null \
-                    | grep -o 'version="[0-9.]*"' | head -1 | grep -o '[0-9.]*')
-          if [ -n "$UBO_VER" ]; then
-            UBO_ZIP="https://github.com/gorhill/uBlock/releases/download/$UBO_VER/uBlock0_$UBO_VER.chromium.zip"
+          # Derive the CRX release URL from gorhill's update manifest (raw.githubusercontent
+          # — no api.github.com rate limit). Parse the <updatecheck codebase="..."> URL, NOT
+          # a bare version=" (that also matches the <?xml version="1.0"?> declaration), then
+          # take the sibling .zip for an unpacked Load-unpacked copy.
+          UBO_CRX=$(curl -fsSL https://raw.githubusercontent.com/gorhill/uBlock/master/dist/chromium/update.xml 2>/dev/null \
+                    | grep -o 'codebase="[^"]*"' | head -1 | sed 's/^codebase="//; s/"$//')
+          UBO_VER=$(printf '%s' "$UBO_CRX" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -n "$UBO_CRX" ]; then
+            UBO_ZIP="${UBO_CRX%.crx}.zip"
             if curl -fsSL "$UBO_ZIP" -o /tmp/ubo.zip 2>/dev/null && unzip -oq /tmp/ubo.zip -d "$UBO_DIR" 2>/dev/null; then
               UBO_SRC="$(dirname "$(find "$UBO_DIR" -name manifest.json 2>/dev/null | head -1)")"
               [ -f "$UBO_SRC/manifest.json" ] || UBO_SRC=""
@@ -522,7 +525,7 @@ jobs:
             # in Default/Extensions/<id> once Chrome fetches the CRX from update_url. If
             # the managed-prefs read didn't take, the staged Desktop copies are the fallback.
             EXT_DIR="$CONSOLE_HOME/Library/Application Support/Google/Chrome/Default/Extensions/$UBO_ID"
-            for i in {1..60}; do sudo test -d "$EXT_DIR" && break; sleep 3; done
+            for i in {1..15}; do sudo test -d "$EXT_DIR" && break; sleep 3; done
             if sudo test -d "$EXT_DIR"; then
               echo "✅ uBlock force-installed by the Managed Preferences policy ($EXT_DIR)"
               MV2_EXT="✅ uBlock (MV2) **force-installed by policy** (Managed Preferences) — persistent. Confirm at \`chrome://extensions\` / \`chrome://policy\`."
@@ -533,10 +536,33 @@ jobs:
               MV2_EXT="⚠️ couldn't stage uBlock — download uBlock Origin's chromium build and Load unpacked it in the desktop"
             fi
 
+            # If the cold start didn't force-install uBlock, the MV2 install gate was only
+            # flipped ~+20s in (when Chrome's framework maps) — around the moment Chrome
+            # first evaluated the forcelist — so uBlock was judged "MV2 → may not install"
+            # and never scheduled. The gate stays flipped, and Chrome retries forced installs
+            # every startup, so relaunch: on a warm start the forcelist is re-evaluated with
+            # MV2 already enabled.
+            if ! sudo test -d "$EXT_DIR"; then
+              for attempt in 1 2 3; do
+                echo "↻ relaunch $attempt: quitting Chrome, relaunching to re-evaluate the forcelist with MV2 enabled ..."
+                sudo -u "$CONSOLE_USER" osascript -e 'quit app "Google Chrome"' 2>/dev/null || true
+                sleep 2; sudo pkill -f 'Contents/MacOS/Google Chrome' 2>/dev/null || true; sleep 3
+                sudo launchctl asuser "$GUI_UID" sudo -u "$CONSOLE_USER" \
+                  bash -c "$ENVV '$CHROME_BIN' --no-first-run --no-default-browser-check $LOGFLAGS https://example.com >> '$CHROME_LOG' 2>&1" &
+                for i in {1..25}; do sudo test -d "$EXT_DIR" && break; sleep 3; done
+                if sudo test -d "$EXT_DIR"; then
+                  echo "✅ uBlock force-installed after relaunch $attempt ($EXT_DIR)"
+                  MV2_EXT="✅ uBlock (MV2) **force-installed by policy** (Managed Preferences), took relaunch $attempt — persistent."
+                  break
+                fi
+                echo "   still not installed after relaunch $attempt"
+              done
+            fi
+
             echo "----- extension force-install trace (Chrome updater/policy log) -----"
             sudo cp "$CHROME_LOG" chrome-mv2.log 2>/dev/null || true
             sudo chmod 644 chrome-mv2.log 2>/dev/null || true
-            grep -aiE "forcelist|force_installed|external.provider|extension_updater|extension_downloader|update.manifest|\.crx|manifest.version|manifest_v2|not allowed|is disabled|blocklist|install.stage|CrxInstall|CRX_|from policy|failed to" chrome-mv2.log 2>/dev/null | tail -50 || echo "(no matching lines)"
+            grep -aiE "forcelist|force_installed|external.provider|extension_updater|extension_downloader|update.manifest|\.crx|manifest.version|manifest_v2|not allowed|is disabled|blocklist|install.stage|CrxInstall|CRX_|from policy|failed to|gorhill|githubusercontent|UserMayInstall|ShouldBlock|may not" chrome-mv2.log 2>/dev/null | tail -60 || echo "(no matching lines)"
 
             # DRM gate: open the castLabs Widevine VMP lab so it's ready to inspect.
             # Widevine provisioning may need a moment on a fresh Chrome; verify in the
