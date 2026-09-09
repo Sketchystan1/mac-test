@@ -9,8 +9,9 @@ sees Google's bytes — verified against castLabs' VMP lab (no `PLATFORM_TAMPERE
 Re-applies every launch.
 
 The catch: to load the dylib, `install.sh` re-signs Chrome's main program ad-hoc (the
-framework and helpers stay stock). Confirmed on **Chrome 152 (arm64)**: 6 MV2 gates
-flipped, MV2 back on, DRM intact.
+framework and helpers stay stock). Confirmed on **Chrome 153.0.8010.37 (arm64)**: 6 MV2
+gates flipped, MV2 back on, uBlock Origin **force-installs from enterprise policy**, DRM
+intact.
 
 ## Build (on a Mac)
 
@@ -32,11 +33,11 @@ MV2_INJECT=dyld ./install.sh "/Applications/Google Chrome.app"
 
 - **dyld** sets `DYLD_INSERT_LIBRARIES=@executable_path/mv` in the bundle's `Info.plist`
   `LSEnvironment`, so a normal Finder/Spotlight launch injects the dylib. Needs no Mach-O
-  header room — the only method that works on Chrome 152, whose main-exe stub is too small
+  header room — the only method that works on current Chrome, whose main-exe stub is too small
   to add a load command to.
 - **loadcmd** injects an `LC_LOAD_DYLIB` into the main exe, dropping a few metadata-only
   load commands (source-version / function-starts / data-in-code — never `LC_UUID`, which
-  dyld requires) to make room. Infeasible on Chrome 152; kept for older builds.
+  dyld requires) to make room. Infeasible on Chrome 152+; kept for older builds.
 
 Both keep the framework stock and re-sign only the main exe (ad-hoc, non-hardened).
 
@@ -67,11 +68,16 @@ sudo defaults write "/Library/Managed Preferences/com.google.Chrome" \
 sudo killall cfprefsd          # make Chrome re-read the managed policy
 ```
 
-Confirm at `chrome://policy` that `ExtensionInstallForcelist` shows **source: Platform**.
-Then **relaunch Chrome, possibly twice**: MV2 is enabled in memory a moment *after* launch,
-so Chrome's first startup can evaluate the force-list before MV2 is on and skip the (still
-"deprecated") uBO; a launch with MV2 already enabled installs it. Success shows up at
+Launch Chrome normally; uBO force-installs on startup — confirmed on **cold start, no relaunch
+needed**. Verify at `chrome://policy` that `ExtensionInstallForcelist` shows **source: Platform**,
+and at `chrome://extensions` that uBlock Origin is **installed by policy**. On disk it lands in
 `~/Library/Application Support/Google/Chrome/Default/Extensions/<id>`.
+
+Off-store force-install specifically depends on the **`LoadChromePolicy` gate** — the `cbz`-kind
+site in `signatures.json` that makes Chrome honor off-store `ExtensionSettings` on unmanaged
+Chrome. The other four `bcond` gates only cover manual enable / Load-unpacked, so without this one
+MV2 turns on but a policy-forced off-store extension is silently skipped. The core implements the
+`cbz` kind, so it works out of the box.
 
 > User-domain `defaults write com.google.Chrome …` is *recommended*-only — it does **not**
 > force-install. It has to be the `/Library/Managed Preferences` path above.
