@@ -118,6 +118,23 @@ jobs:
           OFFLINE_OUT=$(./install.sh --offline "$CHROME_APP" 2>&1) && OFFLINE_RC=0 || OFFLINE_RC=$?
           printf '%s\n' "$OFFLINE_OUT"
 
+          # --- per-milestone coverage diagnostic (read-only) ------------------
+          # mv2-inspect/Locate only reports the single best milestone. To see how
+          # EACH macho-arm64 milestone scores against THIS exact build — e.g. whether
+          # the re-authored 153 milestone matches 153.0.8010.37 and which of its sites
+          # do/don't — feed mv2-inspect one milestone at a time. Nothing is modified.
+          {
+            FW=$(find "$CHROME_APP/Contents/Frameworks" -type f -path "*.framework/Versions/*" -name "* Framework" 2>/dev/null | head -1)
+            if [ -n "$FW" ] && [ -x ./mv2-inspect ] && command -v python3 >/dev/null; then
+              echo "----- per-milestone match on Chrome $CHROME_VER (stock framework) -----"
+              for NM in $(python3 -c "import json;print(chr(10).join(m['name'] for m in json.load(open('signatures.json'))['milestones'] if m.get('container')=='macho-arm64'))"); do
+                python3 -c "import json;d=json.load(open('signatures.json'));d['milestones']=[m for m in d['milestones'] if m['name']=='$NM'];json.dump(d,open('/tmp/one.json','w'))"
+                echo "### $NM"
+                ./mv2-inspect "$FW" /tmp/one.json 2>&1 | sed 's/^/    /'
+              done
+            fi
+          } || true
+
           {
             echo "## 🧩 MV2 mem-patch — in-repo \`mv2-mem-patch-mac@$PATCH_SHA\`"
             echo "- **Chrome:** \`$CHROME_VER\` ($ARCH)"
