@@ -63,8 +63,13 @@ jobs:
           CHROME_APP="/Applications/Google Chrome.app"
 
           # --- Google Chrome + any extra requested packages -------------------
-          echo "📦 installing Google Chrome ..."
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask google-chrome \
+          echo "📦 installing Google Chrome (refresh brew metadata to get the latest stable) ..."
+          # Do NOT set HOMEBREW_NO_AUTO_UPDATE for Chrome: the runner image freezes the
+          # cask at an old build (e.g. 152.x). signatures.json is authored against the
+          # CURRENT stable (153+), so installing the frozen 152 gives only a partial gate
+          # match (force-install gate unpatched). Refresh so we get today's stable.
+          brew update --quiet 2>/dev/null || echo "::warning::brew update reported an issue"
+          brew install --cask google-chrome \
             || echo "::warning::google-chrome cask install reported an issue"
 
           # Optional software requested at dispatch time. Casks are GUI apps,
@@ -88,6 +93,7 @@ jobs:
           fi
           CHROME_VER=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' \
             "$CHROME_APP/Contents/Info.plist" 2>/dev/null || echo unknown)
+          echo "✅ installed Google Chrome $CHROME_VER"
 
           # --- the in-repo patch sources (mv2-mem-patch-mac/) ----------------
           PATCH_SHA="${GITHUB_SHA:0:9}"
