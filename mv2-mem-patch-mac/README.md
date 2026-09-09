@@ -4,49 +4,91 @@ Turns Manifest V2 extensions back on in macOS Chrome. The Mac version of
 `mv2-mem-patch-win/`.
 
 A small **dylib** Chrome loads at startup, patching Chrome's MV2 switch **in memory**.
-*Google Chrome Framework* on disk stays untouched, so Widevine DRM still sees Google's
-bytes. Re-applies every launch.
+The *Google Chrome Framework* on disk stays byte-for-byte stock, so Widevine DRM still
+sees Google's bytes — verified against castLabs' VMP lab (no `PLATFORM_TAMPERED`).
+Re-applies every launch.
 
-The catch: to load the dylib, `install.sh` re-signs Chrome's main program (ad-hoc). The
-framework stays stock, but you should **check Widevine still plays** after installing.
+The catch: to load the dylib, `install.sh` re-signs Chrome's main program ad-hoc (the
+framework and helpers stay stock). Confirmed on **Chrome 152 (arm64)**: 6 MV2 gates
+flipped, MV2 back on, DRM intact.
 
 ## Build (on a Mac)
 
 ```sh
-./build.sh      # needs Xcode Command Line Tools
+./build.sh      # needs Xcode Command Line Tools; builds a universal arm64 + x86_64 dylib
 ```
 
-## Use
+## Install
+
+Two ways to make Chrome load the dylib — choose with `MV2_INJECT`:
 
 ```sh
-./install.sh --offline "/Applications/Google Chrome.app"   # look only
-./install.sh           "/Applications/Google Chrome.app"   # install
+# dyld  — recommended, and REQUIRED on current Chrome (152+)
+MV2_INJECT=dyld ./install.sh "/Applications/Google Chrome.app"
+
+# loadcmd — the default; only works on older Chrome with Mach-O header room
+./install.sh "/Applications/Google Chrome.app"
+```
+
+- **dyld** sets `DYLD_INSERT_LIBRARIES=@executable_path/mv` in the bundle's `Info.plist`
+  `LSEnvironment`, so a normal Finder/Spotlight launch injects the dylib. Needs no Mach-O
+  header room — the only method that works on Chrome 152, whose main-exe stub is too small
+  to add a load command to.
+- **loadcmd** injects an `LC_LOAD_DYLIB` into the main exe, dropping a few metadata-only
+  load commands (source-version / function-starts / data-in-code — never `LC_UUID`, which
+  dyld requires) to make room. Infeasible on Chrome 152; kept for older builds.
+
+Both keep the framework stock and re-sign only the main exe (ad-hoc, non-hardened).
+
+Other modes:
+
+```sh
+./install.sh --offline "/Applications/Google Chrome.app"   # just check signatures.json coverage
 ./install.sh --restore "/Applications/Google Chrome.app"   # undo
 ```
 
-Then enable an MV2 extension.
+**After a Chrome auto-update, re-run `install.sh`** — an update drops a fresh stock main
+exe with no injection, so MV2 turns off again.
 
-## Install uBlock Origin (MV2)
+## Install uBlock Origin (MV2) via policy
 
-Re-enabling MV2 doesn't install the extension. Force-install uBO off-store via Chrome's
-managed policy, then restart Chrome:
+Re-enabling MV2 doesn't install the extension, and on branded Chrome `--load-extension`
+is refused. Force-install uBO through Chrome's **mandatory** policy. macOS has no registry;
+the equivalent of Windows `HKLM\Software\Policies\Google\Chrome\ExtensionSettings` is the
+managed-preferences domain `cfprefsd` serves. That's what MDM / configuration profiles
+populate — but you can write it directly, no MDM needed (confirmed served as a *forced*
+policy via `CFPreferencesAppValueIsForced`):
 
 ```sh
-defaults write com.google.Chrome ExtensionSettings '{"fkgkibajhfbepljeaefdnfnegdcjomkh" = {"installation_mode" = "normal_installed"; "update_url" = "https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml";};}'
+UBO=fkgkibajhfbepljeaefdnfnegdcjomkh
+UPD=https://github.com/gorhill/uBlock/raw/refs/heads/master/dist/chromium/update.xml
+sudo defaults write "/Library/Managed Preferences/com.google.Chrome" \
+  ExtensionInstallForcelist -array "$UBO;$UPD"
+sudo killall cfprefsd          # make Chrome re-read the managed policy
 ```
+
+Confirm at `chrome://policy` that `ExtensionInstallForcelist` shows **source: Platform**.
+Then **relaunch Chrome, possibly twice**: MV2 is enabled in memory a moment *after* launch,
+so Chrome's first startup can evaluate the force-list before MV2 is on and skip the (still
+"deprecated") uBO; a launch with MV2 already enabled installs it. Success shows up at
+`~/Library/Application Support/Google/Chrome/Default/Extensions/<id>`.
+
+> User-domain `defaults write com.google.Chrome …` is *recommended*-only — it does **not**
+> force-install. It has to be the `/Library/Managed Preferences` path above.
+> `ExtensionSettings` (the exact `HKLM` analogue) works too but is a nested dict; the
+> `ExtensionInstallForcelist` array is the simplest reliable force-install from the CLI.
 
 ## Notes
 
-- No SIP change, but editing `/Applications` needs **Full Disk Access** for your
-  terminal (System Settings → Privacy & Security).
-- Re-run `install.sh` after Chrome auto-updates.
-- Chrome's main program is a tiny stub with little header room. The dylib installs
-  next to it as `Contents/MacOS/mv` and loads via a short `@loader_path/mv` path so
-  the load command fits; the injector also drops a few metadata-only load commands
-  (UUID / source-version / function-starts / data-in-code) from the stub to make
-  room. Execution is unaffected; the framework and helpers are never touched.
-  `signatures.json` stays in `Contents/Resources/mv2/` (a data file under
-  `Contents/Frameworks/` would break the codesign seal). `--restore` undoes it all.
-- Debug: `MV2_MEMPATCH_DEBUG=1 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`.
-- DRM: if Widevine drops a tier, the ad-hoc signature is why — `--restore` and use the
-  disk patch `chrome-mv2.sh` instead.
+- No SIP change, but editing `/Applications` needs **Full Disk Access** for your terminal
+  (System Settings → Privacy & Security).
+- The dylib installs as `Contents/MacOS/mv`; `signatures.json` lives in
+  `Contents/Resources/mv2/` (a data file under `Contents/Frameworks/` would break the
+  codesign seal). `--restore` undoes everything.
+- Debug: `MV2_MEMPATCH_DEBUG=1 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`
+  and watch stderr for `[mv2patch] … MV2 extensions ENABLED`.
+- DRM: the framework is left stock precisely to preserve Widevine's VMP hash. If a tier
+  ever drops, the ad-hoc re-sign of the main exe is the only suspect — `--restore` reverts
+  to Google's signature.
+- A CI testbed that builds + installs this on a fresh Chrome and hands you a VNC desktop
+  to verify it live is in `.github/workflows/mv2-mem-patch-mac.yml`.
