@@ -132,6 +132,13 @@ jobs:
                 echo "### $NM"
                 ./mv2-inspect "$FW" /tmp/one.json 2>&1 | sed 's/^/    /'
               done
+              # The only gate that drifts per-build is LoadChromePolicy (off-store
+              # ExtensionSettings / force-install). Its pattern skeleton is stable
+              # (E00314AA … +12=0B000014 +16=F40300AA) with a bl+cbz in the middle that
+              # shifts each release. Dump the actual bytes at that skeleton in THIS build
+              # so the site can be re-authored for the exact version the runner uses.
+              echo "----- candidate LoadChromePolicy (force-install) gate bytes in this build -----"
+              python3 -c "import sys,re; d=open(sys.argv[1],'rb').read(); H=[m.start() for m in re.finditer(bytes.fromhex('E00314AA'), d) if d[m.start()+12:m.start()+16]==bytes.fromhex('0B000014') and d[m.start()+16:m.start()+20]==bytes.fromhex('F40300AA')]; print('  skeleton candidates:', len(H)); [print('  off=0x%X sig20=%s' % (h, d[h:h+20].hex().upper())) for h in H[:12]]" "$FW" 2>&1 | sed 's/^/    /'
             fi
           } || true
 
