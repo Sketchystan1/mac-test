@@ -122,12 +122,13 @@ inline std::vector<Milestone> ParseMilestones(const JV& doc) {
       Site s;
       s.name = sd.get("name") ? sd.get("name")->str : "?";
       std::string k = sd.get("kind") ? sd.get("kind")->str : "short";
-      s.kind = (k == "bcond") ? 2 : (k == "near") ? 1 : 0;
+      s.kind = (k == "cbz") ? 3 : (k == "bcond") ? 2 : (k == "near") ? 1 : 0;
       s.sig = HexToBytes(sd.get("sig") ? sd.get("sig")->str : "");
       s.jgOff = sd.get("jgOff") ? (int)sd.get("jgOff")->num : 0;
       s.expected = sd.get("expectedMatches") ? (int)sd.get("expectedMatches")->num : 1;
-      int need = (s.kind == 2) ? 4 : (s.kind == 1) ? 6 : 2;      // bytes the matcher touches at/after jgOff
-      if (s.sig.size() < 2 || s.jgOff < 0 || s.expected < 1 || (int)s.sig.size() < s.jgOff + need) continue;
+      int need = (s.kind == 2 || s.kind == 3) ? 4 : (s.kind == 1) ? 6 : 2;  // bytes the matcher touches at/after jgOff
+      if (s.sig.size() < 2 || s.jgOff < 0 || s.expected < 1 || (int)s.sig.size() < s.jgOff + need ||
+          (s.kind == 3 && s.jgOff % 4 != 0)) continue;
       mo.sites.push_back(std::move(s));
     }
     if (!mo.sites.empty()) out.push_back(std::move(mo));
@@ -235,10 +236,47 @@ inline bool ParseMachO(const uint8_t* b, size_t n, uint32_t wantCpu, HostSlice& 
 }
 
 // ---------------------------------------------------------- matching --------
+// ARM64 cbz-gate helpers (the LoadChromePolicy off-store-ExtensionSettings gate).
+// A cbz gate is the stock CBZ (0x34) which we rewrite to an unconditional B
+// (0x14) with the SAME resolved target — imm26 recomputed from the sign-extended
+// imm19, since the field layouts differ. Embedded BL/B words in the sig carry
+// build-specific PC-relative displacements and are matched by opcode class only.
+inline uint32_t Rd32LE(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+inline int32_t SignExtend32(uint32_t v, int bits) {
+  return (v & (1u << (bits - 1))) ? (int32_t)(v - (1u << bits)) : (int32_t)v;
+}
+inline bool CbzWordOk(uint32_t cand, uint32_t sigw) {
+  if ((cand & 0xFF000000u) == 0x34000000u) return (cand & 0x1Fu) == (sigw & 0x1Fu);   // stock CBZ: imm19 wild, Rt pinned
+  if ((cand & 0xFC000000u) == 0x14000000u)                                            // patched B: same resolved target
+    return SignExtend32(cand & 0x03FFFFFFu, 26) == SignExtend32((sigw >> 5) & 0x7FFFFu, 19);
+  return false;
+}
+inline bool CbzEmbeddedBranch(const std::vector<uint8_t>& sig, int wpos) {           // B or BL word (displacement wild)
+  uint32_t klass = Rd32LE(&sig[wpos]) & 0xFC000000u;
+  return klass == 0x14000000u || klass == 0x94000000u;
+}
+
 // Match sig at absolute offset `start`, wildcarding the branch opcode and its
 // displacement so BOTH stock and already-patched builds match (idempotent).
 inline bool SigAt(const uint8_t* b, size_t n, uint64_t start, const std::vector<uint8_t>& sig, int jgOff, int kind) {
   if (start + sig.size() > n) return false;
+  if (kind == 3) {                                   // cbz (arm64 CBZ->B gate)
+    int sn = (int)sig.size();
+    if (jgOff + 4 > sn) return false;
+    if (!CbzWordOk(Rd32LE(b + start + jgOff), Rd32LE(&sig[jgOff]))) return false;
+    for (int k = 0; k < sn; k++) {
+      int w = k & ~3;                                // 4-byte word holding byte k (sig word-aligned; jgOff%4==0)
+      if (k >= jgOff && k < jgOff + 4) continue;      // the CBZ/B gate word: validated above
+      if (w + 4 <= sn && w != jgOff && CbzEmbeddedBranch(sig, w)) {   // embedded BL/B: opcode class only
+        if (k == w && (Rd32LE(b + start + w) & 0xFC000000u) != (Rd32LE(&sig[w]) & 0xFC000000u)) return false;
+        continue;
+      }
+      if (b[start + k] != sig[k]) return false;
+    }
+    return true;
+  }
   for (size_t k = 0; k < sig.size(); k++) {
     uint8_t p = b[start + k];
     if ((int)k == jgOff) {
@@ -331,9 +369,9 @@ inline bool Locate(const uint8_t* buf, size_t bufN, uint64_t scanStart, uint64_t
 // ------------------------------------------------------------- apply --------
 struct ApplyRes { std::vector<uint8_t> patch; bool isStock = false; bool isDone = false; bool known = false; };
 
-// Given the 2 current bytes at the branch, decide the write. Read is always 2
-// bytes; write is 1 (short/bcond) or 2 (near).
-inline ApplyRes ComputeApply(int kind, const uint8_t cur[2]) {
+// Given the current bytes at the branch (up to 4, for the cbz gate word), decide
+// the write. Write is 1 (short/bcond), 2 (near), or 4 (cbz: CBZ rewritten to B).
+inline ApplyRes ComputeApply(int kind, const uint8_t cur[4]) {
   ApplyRes r;
   if (kind == 0) {                                 // short
     r.isStock = (cur[0] == 0x7F); r.isDone = (cur[0] == 0xEB);
@@ -341,6 +379,13 @@ inline ApplyRes ComputeApply(int kind, const uint8_t cur[2]) {
   } else if (kind == 1) {                          // near
     r.isStock = (cur[0] == 0x0F && cur[1] == 0x8F); r.isDone = (cur[0] == 0x90 && cur[1] == 0xE9);
     r.patch = { 0x90, 0xE9 };
+  } else if (kind == 3) {                          // cbz: CBZ(0x34)->uncond B(0x14), imm26 from sign-extended imm19
+    uint32_t w = Rd32LE(cur);
+    r.isStock = ((w & 0xFF000000u) == 0x34000000u);
+    r.isDone  = ((w & 0xFC000000u) == 0x14000000u);
+    uint32_t nw = 0x14000000u | ((uint32_t)SignExtend32((w >> 5) & 0x7FFFFu, 19) & 0x03FFFFFFu);
+    r.patch = { (uint8_t)(nw & 0xFF), (uint8_t)((nw >> 8) & 0xFF),
+                (uint8_t)((nw >> 16) & 0xFF), (uint8_t)((nw >> 24) & 0xFF) };
   } else {                                         // bcond: rewrite condition nibble GT(0xC)->AL(0xE)
     uint8_t lo = cur[0] & 0x0F;
     r.isStock = (lo == 0x0C); r.isDone = (lo == 0x0E);

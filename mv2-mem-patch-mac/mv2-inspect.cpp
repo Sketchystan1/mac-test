@@ -111,7 +111,10 @@ int main(int argc, char** argv) {
   int n = 0;
   for (const auto& sh : per) {
     for (uint64_t off : sh.branchOffsets) {
-      uint8_t cur[2] = {buf[off], off + 1 < buf.size() ? buf[off + 1] : (uint8_t)0};
+      uint8_t cur[4] = {buf[off],
+                        off + 1 < buf.size() ? buf[off + 1] : (uint8_t)0,
+                        off + 2 < buf.size() ? buf[off + 2] : (uint8_t)0,
+                        off + 3 < buf.size() ? buf[off + 3] : (uint8_t)0};
       mv2::ApplyRes a = mv2::ComputeApply(sh.site.kind, cur);
       const char* state = a.isStock ? "stock" : a.isDone ? "already-patched" : "UNEXPECTED";
       printf("  %-28s file 0x%llX  %s\n", sh.site.name.c_str(),

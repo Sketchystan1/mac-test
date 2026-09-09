@@ -209,7 +209,7 @@ static int ApplyInProcess(const mv2::HostSlice& slice,
     for (uint64_t branchFileOff : sh.branchOffsets) {
       uint64_t rt = mv2::RuntimeAddr(slice, branchFileOff, imageLoadAddr);
       uint8_t* addr = (uint8_t*)(uintptr_t)rt;
-      uint8_t cur[2] = {addr[0], addr[1]};
+      uint8_t cur[4] = {addr[0], addr[1], addr[2], addr[3]};
       mv2::ApplyRes a = mv2::ComputeApply(sh.site.kind, cur);
       if (a.isDone) { alreadyDone++; continue; }
       if (!a.isStock) { DBG("unexpected gate bytes — skipped"); continue; }
